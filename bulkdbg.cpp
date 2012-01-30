@@ -335,14 +335,6 @@ static void read_proc_map_ent(char *line, proc_info& pinfo,
   if (e.stbl != 0) {
     /* wrong? */
     e.relative = check_shlib(e.path);
-#if 0
-    if (e.path.substr(0, 8) == "/lib/ld-" ||
-    	e.path.substr(0, 10) == "/lib64/ld-" ||
-    	e.path.substr(0, 18) == "/lib64/libpthread-" ||
-    	e.path.substr(0, 12) == "/lib64/libc-") {
-      e.relative = false;
-    }
-#endif
     DBG(10, fprintf(stderr, "%s: relative=%d addr_begin=%lx\n", e.path.c_str(),
       (int)e.relative, e.addr_begin));
   }
