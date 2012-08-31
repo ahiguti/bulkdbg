@@ -396,7 +396,7 @@ static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
   vals_r.push_back(ip);
   unsigned int i = 0;
   for (i = 0; i < maxlen; ++i) {
-    unsigned int retaddr = 0;
+    unsigned long retaddr = 0;
     retaddr = ptrace(PTRACE_PEEKDATA, pid, sp + i * sizeof(long), 0);
     if (errno != 0) {
       break;
