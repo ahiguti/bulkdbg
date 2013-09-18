@@ -1,6 +1,6 @@
 
 CXXFLAGS = -g -Wall -O
-LIBS = -lbfd -liberty -lz -lelf
+LIBS = -lbfd -liberty -lz -lelf -lunwind-$(shell uname -p) -lunwind-ptrace
 
 bulkdbg: bulkdbg.cpp syscall_table.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)

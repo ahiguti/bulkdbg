@@ -1,4 +1,6 @@
 
+// vim: ai sw=2
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -21,6 +23,9 @@
 
 #include <linux/version.h>
 #include <asm/unistd.h>
+
+#include <libunwind-ptrace.h>
+
 #include "syscall_table.hpp"
 
 #define DBG(v, x) if (debug_level >= v) { x; }
@@ -50,13 +55,9 @@ typedef std::vector<syscall_info> syscall_info_arr_type;
 
 static int debug_level = 0;
 static int group_bt = 0;
-#if defined(__i386__)
-static int trace_fp = 100;
+static int trace_unw = 100;
+static int trace_fp = 0;
 static int trace_sp = 0;
-#else
-static int trace_fp = 0; /* trace_fp does not work well */
-static int trace_sp = 100;
-#endif
 static int dump_sp = 0;
 static int dump_regs = 0;
 static int do_strace = 0;
@@ -281,6 +282,10 @@ static bool check_shlib(const std::string& fn)
   Elf64_Ehdr *const ehdr = elf64_getehdr(elf);
   Elf64_Phdr *const phdr = elf64_getphdr(elf);
   #endif
+  if (ehdr == 0 || phdr == 0) {
+    /* TODO: support Elf32 on x86_64 */
+    return false;
+  }
   const int num_phdr = ehdr->e_phnum;
   for (int i = 0; i < num_phdr; ++i) {
     #if defined(__i386__)
@@ -327,7 +332,7 @@ static void read_proc_map_ent(char *line, proc_info& pinfo,
   e.addr_size = a1 - a0;
   e.offset = atol(t2 + 1);
   e.path = std::string(t5 + 1);
-  if (e.path == "[vdso]") {
+  if (e.path == "[vdso]" || e.path == "[vsyscall]") {
     e.is_vdso = true;
   } else {
     e.stbl = stmap.get(e.path);
@@ -355,6 +360,62 @@ static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
   }
   std::sort(pi.maps.begin(), pi.maps.end(), std::less<unsigned long>());
     /* already sorted? */
+}
+
+static int get_stack_trace_unw(unw_addr_space_t unw_as, int pid,
+  proc_info& pinfo, unsigned int maxlen, const user_regs_struct& regs,
+  std::vector<unsigned long>& vals_r)
+{
+  struct UPT_info *ui = (struct UPT_info *)_UPT_create(pid);
+  unw_cursor_t cur;
+  do {
+    if (unw_init_remote(&cur, unw_as, ui) < 0) {
+      DBG(0, fprintf(stderr, "unw_init_remote failed\n"));
+      break;
+    }
+    unw_word_t ip_prev = 0;
+    for (unsigned int i = 0; i < maxlen; ++i) {
+      unw_word_t ip, sp;
+      if (unw_get_reg(&cur, UNW_REG_IP, &ip) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_reg ip failed\n"));
+	break;
+      }
+      DBG(10, fprintf(stderr, "ip=%lx\n", ip));
+      if (ip_prev == ip) {
+	break;
+      }
+      ip_prev = ip;
+      vals_r.push_back(ip);
+      if (unw_get_reg(&cur, UNW_REG_SP, &sp) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_reg sp failed\n"));
+	break;
+      }
+      #if 0
+      {
+	char buf[256];
+	unw_word_t off = 0;
+	unw_get_proc_name(&cur, buf, sizeof(buf), &off);
+	//  DBG(0, fprintf(stderr, "unw_get_proc_name failed\n"));
+	//  break;
+	//}
+	// printf("IP %s(%lx)\n", buf, off);
+      }
+      #endif
+      #if 0
+      unw_proc_info_t pi;
+      if (unw_get_proc_info(&cur, &pi) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_proc_info failed\n"));
+	break;
+      }
+      #endif
+      if (unw_step(&cur) < 0) {
+	DBG(0, fprintf(stderr, "unw_step failed\n"));
+	break;
+      }
+    } 
+  } while (0);
+  _UPT_destroy(ui);
+  return 0;
 }
 
 static int get_stack_trace(int pid, proc_info& pinfo, unsigned int maxlen,
@@ -635,9 +696,13 @@ static void dump_user_regs(int pid, const user_regs_struct& regs)
 static int bulkdbg_pids(const std::vector<int>& pids)
 {
   unsigned int trace_length = 0;
+  unsigned int unwlength = 0;
   unsigned int fplength = 0;
   unsigned int splength = 0;
-  if (trace_fp) {
+  if (trace_unw) {
+    unwlength = trace_unw;
+    trace_length = trace_unw;
+  } else if (trace_fp) {
     fplength = trace_fp;
     splength = dump_sp;
     trace_length = trace_fp;
@@ -645,6 +710,13 @@ static int bulkdbg_pids(const std::vector<int>& pids)
     fplength = 0;
     splength = std::max(trace_sp, dump_sp);
     trace_length = trace_sp;
+  }
+  unw_addr_space_t unw_as = 0;
+  if (trace_unw != 0) {
+    unw_as = unw_create_addr_space(&_UPT_accessors, 0);
+    if (!unw_as) {
+      return -1;
+    }
   }
   symbol_table_map stmap;
   typedef std::map<std::string, unsigned> cntmap_type;
@@ -662,6 +734,10 @@ static int bulkdbg_pids(const std::vector<int>& pids)
       if (get_user_regs(pid, regs) != 0) {
         failed = true;
       } else {
+	if (unwlength &&
+	  get_stack_trace_unw(unw_as, pid, pinfo, 100, regs, vals_fp) != 0) {
+	  failed = true;
+	};
 	if (fplength &&
 	  get_stack_trace(pid, pinfo, fplength, regs, vals_fp) != 0) {
 	  failed = true;
@@ -675,7 +751,7 @@ static int bulkdbg_pids(const std::vector<int>& pids)
     ptrace_detach_proc(pid);
     std::string tr;
     if (!failed) {
-      if (trace_fp) {
+      if (trace_unw || trace_fp) {
         tr = examine_stack_trace(pinfo, regs, vals_fp, trace_length);
       } else {
         tr = examine_stack_trace(pinfo, regs, vals_sp, trace_length);
@@ -687,7 +763,7 @@ static int bulkdbg_pids(const std::vector<int>& pids)
       tr = "[notfound]";
     }
     if (group_bt == 0) {
-      if (trace_sp != 0 || trace_fp != 0) {
+      if (trace_sp != 0 || trace_fp != 0 || trace_unw != 0) {
         printf("%d\t%s\n", pid, tr.c_str());
       }
       if (dump_regs) {
@@ -705,6 +781,9 @@ static int bulkdbg_pids(const std::vector<int>& pids)
       ++i) {
       printf("%u\t%s\n", i->second, i->first.c_str());
     }
+  }
+  if (trace_unw != 0) {
+    unw_destroy_addr_space(unw_as);
   }
   return 0;
 }
@@ -829,12 +908,20 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
         debug_level = vint;
       } else if (k == "group") {
         group_bt = vint;
+      } else if (k == "unwtrace" || k == "fptrace") {
+        trace_unw = vint;
+        trace_fp = 0;
+        trace_sp = 0;
+      #if 0
       } else if (k == "fptrace") {
         trace_fp = vint;
+        trace_unw = 0;
         trace_sp = 0;
+      #endif
       } else if (k == "sptrace") {
-        trace_fp = 0;
         trace_sp = vint;
+        trace_fp = 0;
+        trace_unw = 0;
       } else if (k == "spdump") {
         dump_sp = vint;
       } else if (k == "regs") {
@@ -852,7 +939,23 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
 
 static int usage(const char *argv0)
 {
-  fprintf(stderr, "Usage: %s PROCESS_ID [...]\n", argv0);
+  fprintf(stderr,
+    "Usage: \n"
+    "  %s [OPTIONS] PROCESS_OR_THREAD_ID [...]\n", argv0);
+  fprintf(stderr,
+    "Options: \n"
+    "  fptrace=100      - show stack trace for each process/thread\n"
+    "  offset=0         - show ip offset for each frame\n"
+    "  debug=0          - show debug message\n"
+    "  group=0          - group processes/threads by stack trace\n"
+    "  regs=0           - show registers\n"
+    #if 0
+    "  unwtrace=0       - ???\n"
+    "  fptrace=0        - ???\n"
+    #endif
+    "  sptrace=0        - ???\n"
+    "  spdump=0         - ???\n"
+    "  strace=0         - ???\n");
   return 1;
 }
 
