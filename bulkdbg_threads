@@ -2,9 +2,13 @@
 use strict;
 use warnings;
 use IO::Dir;
+use File::Basename;
+my $dir_name = File::Basename::dirname($0);
 my @argv = ();
+my $pid_count = 0;
 for my $arg (@ARGV) {
   if ($arg =~ /^\d+$/) {
+    ++$pid_count;
     my $d = new IO::Dir("/proc/$arg/task");
     if (defined($d)) {
       while (my $e = $d->read()) {
@@ -17,4 +21,9 @@ for my $arg (@ARGV) {
     push(@argv, $arg);
   }
 }
-exec("bulkdbg", @argv);
+if ($pid_count == 1) {
+  # all tids belong to the same process. set samemap=1.
+  push(@argv, "samemap=1");
+}
+system("$dir_name/bulkdbg", @argv);
+# TODO: send SIGCONT?

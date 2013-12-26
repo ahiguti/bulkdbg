@@ -55,7 +55,9 @@ typedef std::vector<syscall_info> syscall_info_arr_type;
 
 static int debug_level = 0;
 static int group_bt = 0;
+static int procstat = 0;
 static int trace_unw = 100;
+static int same_map = 0;
 static int trace_fp = 0;
 static int trace_sp = 0;
 static int dump_sp = 0;
@@ -178,6 +180,7 @@ struct symbol_table_map {
     m[path] = p.get(); /* can be 0 */
     return p.release();
   }
+  bool empty() const { return m.empty(); }
  private:
   typedef std::map<std::string, symbol_table *> m_type;
   m_type m;
@@ -273,7 +276,9 @@ static bool check_shlib(const std::string& fn)
   if (elf == 0) {
     return false;
   }
+  #if 0
   bool found = false;
+  #endif
   unsigned long vaddr = 0;
   #if defined(__i386__)
   Elf32_Ehdr *const ehdr = elf32_getehdr(elf);
@@ -295,7 +300,9 @@ static bool check_shlib(const std::string& fn)
     #endif
     if (p->p_type == PT_LOAD && (p->p_flags & 1) != 0) {
       vaddr = p->p_vaddr;
+      #if 0
       found = true;
+      #endif
       break;
     }
   }
@@ -358,8 +365,10 @@ static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
   while (fgets(buf, sizeof(buf), fp) != 0) {
     read_proc_map_ent(buf, pi, stmap);
   }
+  #if 0
   std::sort(pi.maps.begin(), pi.maps.end(), std::less<unsigned long>());
     /* already sorted? */
+  #endif
 }
 
 static int get_stack_trace_unw(unw_addr_space_t unw_as, int pid,
@@ -409,7 +418,7 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as, int pid,
       }
       #endif
       if (unw_step(&cur) < 0) {
-	DBG(0, fprintf(stderr, "unw_step failed\n"));
+	DBG(1, fprintf(stderr, "unw_step failed\n"));
 	break;
       }
     } 
@@ -468,6 +477,39 @@ static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
     vals_r.push_back(retaddr);
   }
   return 0;
+}
+
+static int get_ipreg_procstat(int pid, proc_info& pinfo, std::vector<unsigned long>& vals_r)
+{
+  char fn[1024];
+  char buf[4096];
+  snprintf(fn, sizeof(fn), "/proc/%d/stat", pid);
+  auto_fp fp(fopen(fn, "r"));
+  if (fp == 0) {
+    return 1;
+  }
+  if (fgets(buf, sizeof(buf), fp) != 0) {
+    buf[4095] = 0;
+    char *p = strrchr(buf, ')');
+    if (p != 0) {
+      int cnt = 0;
+      for (; *p != 0 && cnt < 28; ++p) {
+	if (*p == ' ') {
+	  ++cnt;
+	}
+      }
+      char *q = p;
+      for (; *q != 0 && *q != ' '; ++q) { }
+      if (*q != 0) {
+	*q = 0;
+	unsigned long v = strtoul(p, 0, 10);
+	if (v != ULONG_MAX) {
+	  vals_r.push_back(v);
+	}
+      }
+    }
+  }
+  return vals_r.empty();
 }
 
 static int get_user_regs(int pid, user_regs_struct& regs)
@@ -558,11 +600,25 @@ const syscall_info *find_syscall(const user_regs_struct& regs)
   return sinfo;
 }
 
+static std::string ulong_to_str_hex(unsigned long v)
+{
+  char buf[64];
+  if (sizeof(v) == 4) {
+    snprintf(buf, sizeof(buf), ":%08lx ", v);
+  } else {
+    snprintf(buf, sizeof(buf), ":%016lx ", v);
+  }
+  return buf;
+}
+
 static std::string examine_stack_trace(const proc_info& pinfo,
    const user_regs_struct& regs, const std::vector<unsigned long>& vals,
    size_t maxlen)
 {
   std::string rstr;
+  #if 0
+  rstr = ulong_to_str_hex(vals.size()); // FIXME
+  #endif
   /* vals[0] is ip */
   for (size_t i = 0; i < std::min(vals.size(), maxlen); ++i) {
     unsigned long addr = vals[i];
@@ -584,7 +640,7 @@ static std::string examine_stack_trace(const proc_info& pinfo,
 	}
 	if (show_offset) {
 	  char buf[32];
-	  snprintf(buf, 32, "(%lx)", offset);
+	  snprintf(buf, 32, "(%lx+%lx)", addr-offset, offset);
 	  rstr += std::string(buf);
 	}
       }
@@ -593,7 +649,7 @@ static std::string examine_stack_trace(const proc_info& pinfo,
       if (i == 0 && offset == 0x410) { // TODO: correct?
         const syscall_info *sinfo = find_syscall(regs);
 	if (sinfo != 0) {
-	  rstr += std::string(sinfo->name);
+	  rstr += "(" + std::string(sinfo->name) + ")";
 	}
       }
     }
@@ -626,17 +682,6 @@ static void dump_stack(int pid, const proc_info& pinfo, unsigned long sp,
       }
     }
   }
-}
-
-static std::string ulong_to_str_hex(unsigned long v)
-{
-  char buf[64];
-  if (sizeof(v) == 4) {
-    snprintf(buf, sizeof(buf), ":%08lx ", v);
-  } else {
-    snprintf(buf, sizeof(buf), ":%016lx ", v);
-  }
-  return buf;
 }
 
 static void dump_user_regs(int pid, const user_regs_struct& regs)
@@ -690,7 +735,7 @@ static void dump_user_regs(int pid, const user_regs_struct& regs)
   #endif
   #undef DUMP_REGS
   s.resize(s.size() - 1);
-  printf("%d r %s\n", pid, s.c_str());
+  printf("%d\tr %s\n", pid, s.c_str());
 }
 
 static int bulkdbg_pids(const std::vector<int>& pids)
@@ -718,40 +763,50 @@ static int bulkdbg_pids(const std::vector<int>& pids)
       return -1;
     }
   }
+  int pid = -1;
+  proc_info pinfo;
   symbol_table_map stmap;
   typedef std::map<std::string, unsigned> cntmap_type;
   cntmap_type cntmap;
   for (size_t i = 0; i < pids.size(); ++i) {
-    const int pid = pids[i];
-    proc_info pinfo;
+    pid = pids[i];
     std::vector<unsigned long> vals_fp, vals_sp;
     user_regs_struct regs = { 0 };
-    read_maps(pid, pinfo, stmap);
+    if (!same_map || stmap.empty()) {
+      pinfo = proc_info();
+      read_maps(pid, pinfo, stmap);
+    }
     bool failed = false;
-    if (ptrace_attach_proc(pid) != 0) {
-      failed = true;
+    if (procstat) {
+      if (get_ipreg_procstat(pid, pinfo, vals_fp) != 0) {
+	failed = true;
+      }
     } else {
-      if (get_user_regs(pid, regs) != 0) {
-        failed = true;
+      if (ptrace_attach_proc(pid) != 0) {
+	failed = true;
       } else {
-	if (unwlength &&
-	  get_stack_trace_unw(unw_as, pid, pinfo, 100, regs, vals_fp) != 0) {
+	if (get_user_regs(pid, regs) != 0) {
 	  failed = true;
-	};
-	if (fplength &&
-	  get_stack_trace(pid, pinfo, fplength, regs, vals_fp) != 0) {
-	  failed = true;
-	}
-	if (splength &&
-	  get_stack_trace_sp(pid, pinfo, splength, regs, vals_sp) != 0) {
-	  failed = true;
+	} else {
+	  if (unwlength &&
+	    get_stack_trace_unw(unw_as, pid, pinfo, 100, regs, vals_fp) != 0) {
+	    failed = true;
+	  }
+	  if (fplength &&
+	    get_stack_trace(pid, pinfo, fplength, regs, vals_fp) != 0) {
+	    failed = true;
+	  }
+	  if (splength &&
+	    get_stack_trace_sp(pid, pinfo, splength, regs, vals_sp) != 0) {
+	    failed = true;
+	  }
 	}
       }
+      ptrace_detach_proc(pid);
     }
-    ptrace_detach_proc(pid);
     std::string tr;
     if (!failed) {
-      if (trace_unw || trace_fp) {
+      if (procstat || trace_unw || trace_fp) {
         tr = examine_stack_trace(pinfo, regs, vals_fp, trace_length);
       } else {
         tr = examine_stack_trace(pinfo, regs, vals_sp, trace_length);
@@ -918,6 +973,8 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
         trace_unw = 0;
         trace_sp = 0;
       #endif
+      } else if (k == "procstat") {
+	procstat = vint;
       } else if (k == "sptrace") {
         trace_sp = vint;
         trace_fp = 0;
@@ -930,6 +987,8 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
         do_strace = vint;
       } else if (k == "offset") {
         show_offset = vint;
+      } else if (k == "samemap") {
+	same_map = vint;
       }
     } else {
       pids_r.push_back(atoi(argv[i]));
@@ -944,17 +1003,17 @@ static int usage(const char *argv0)
     "  %s [OPTIONS] PROCESS_OR_THREAD_ID [...]\n", argv0);
   fprintf(stderr,
     "Options: \n"
-    "  fptrace=100      - show stack trace for each process/thread\n"
     "  offset=0         - show ip offset for each frame\n"
     "  debug=0          - show debug message\n"
     "  group=0          - group processes/threads by stack trace\n"
     "  regs=0           - show registers\n"
     #if 0
+    "  fptrace=100      - show stack trace for each process/thread\n"
     "  unwtrace=0       - ???\n"
-    "  fptrace=0        - ???\n"
     #endif
     "  sptrace=0        - ???\n"
     "  spdump=0         - ???\n"
+    "  procstat=0       - ???\n"
     "  strace=0         - ???\n");
   return 1;
 }
