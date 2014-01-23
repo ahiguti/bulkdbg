@@ -11,3 +11,8 @@ generate:
 clean:
 	rm -f bulkdbg
 
+rpm: clean
+	cd .. && tar cvz --exclude=.git -f /tmp/bulkdbg.tar.gz bulkdbg && \
+		rpmbuild -ta /tmp/bulkdbg.tar.gz && \
+		rm -f /tmp/bulkdbg.tar.gz
+

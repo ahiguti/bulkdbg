@@ -20,6 +20,7 @@
 #include <bfd.h>
 #include <algorithm>
 #include <libelf.h>
+#include <cxxabi.h>
 
 #include <linux/version.h>
 #include <asm/unistd.h>
@@ -611,6 +612,18 @@ static std::string ulong_to_str_hex(unsigned long v)
   return buf;
 }
 
+static std::string cxxdemangle(const char *s)
+{
+  int status = 0;
+  char *p = abi::__cxa_demangle(s, 0, 0, &status);
+  if (p != 0) {
+    std::string r(p);
+    free(p);
+    return r;
+  }
+  return std::string(s);
+}
+
 static std::string examine_stack_trace(const proc_info& pinfo,
    const user_regs_struct& regs, const std::vector<unsigned long>& vals,
    size_t maxlen)
@@ -636,7 +649,7 @@ static std::string examine_stack_trace(const proc_info& pinfo,
 	if (sinfo != 0) {
 	  rstr += std::string(sinfo->name);
 	} else {
-	  rstr += e->name;
+	  rstr += cxxdemangle(e->name.c_str());
 	}
 	if (show_offset) {
 	  char buf[32];
