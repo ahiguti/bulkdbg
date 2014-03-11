@@ -751,73 +751,7 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 	  }
 	}
       }
-      #if 0
-      // FIXME temp code
-      {
-	unsigned long offset = 0;
-	const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
-	if (e != 0 && e->name == "handle_one_connection") {
-	  fprintf(stderr, "rsp=%lx\n", sp);
-	  unsigned long thdp = ptrace(PTRACE_PEEKDATA, pid, sp + 24, 0);
-	  unsigned long thdid = ptrace(PTRACE_PEEKDATA, pid, thdp + 6400, 0);
-	  unsigned long qslen = ptrace(PTRACE_PEEKDATA, pid, thdp + 104, 0);
-	  unsigned long qsp = ptrace(PTRACE_PEEKDATA, pid, thdp + 96, 0);
-	  std::vector<char> buf(qslen + 1);
-	  for (unsigned long i = 0; i < qslen; i += sizeof(long)) {
-	    unsigned long v = ptrace(PTRACE_PEEKDATA, pid, qsp + i, 0);
-	    if (i + sizeof(long) <= qslen) {
-	      memcpy(&buf[i], &v, sizeof(long));
-	    } else {
-	      memcpy(&buf[i], &v, qslen - i);
-	    }
-	  }
-	  fprintf(stderr, "tid=%lu qlen=%d q=%s\n", thdid, (int)qslen, &buf[0]);
-	}
-      }
-      #endif
-      #if 0
-      // FIXME temp code
-      {
-	unsigned long offset = 0;
-	const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
-	if (e != 0 && e->name == "_Z24do_handle_one_connectionP3THD") {
-	  unsigned long thdp = ptrace(PTRACE_PEEKDATA, pid, sp + 8, 0);
-	  unsigned long thdid = ptrace(PTRACE_PEEKDATA, pid, thdp + 0x3230, 0);
-	  unsigned long qslen = ptrace(PTRACE_PEEKDATA, pid, thdp + 104, 0);
-	  unsigned long qsp = ptrace(PTRACE_PEEKDATA, pid, thdp + 96, 0);
-	  fprintf(stderr, "thdp=%lx qslen=%lu qsp=%lx\n", thdp, qslen, qsp);
-	  std::vector<char> buf(qslen + 1);
-	  for (unsigned short i = 0; i < qslen; i += sizeof(long)) {
-	    unsigned long v = ptrace(PTRACE_PEEKDATA, pid, qsp + i, 0);
-	    if (i + sizeof(long) <= qslen) {
-	      memcpy(&buf[i], &v, sizeof(long));
-	    } else {
-	      memcpy(&buf[i], &v, qslen - i);
-	    }
-	  }
-	  fprintf(stderr, "tid=%lu qlen=%d q=%s\n", thdid, (int)qslen, &buf[0]);
-	}
-      }
-      #endif
-      /* dont use unw_get_proc_name because it's too slow */
-      #if 0
-      {
-	char buf[256];
-	unw_word_t off = 0;
-	unw_get_proc_name(&cur, buf, sizeof(buf), &off);
-	//  DBG(0, fprintf(stderr, "unw_get_proc_name failed\n"));
-	//  break;
-	//}
-	// printf("IP %s(%lx)\n", buf, off);
-      }
-      #endif
-      #if 0
-      unw_proc_info_t pi;
-      if (unw_get_proc_info(&cur, &pi) < 0) {
-	DBG(0, fprintf(stderr, "unw_get_proc_info failed\n"));
-	break;
-      }
-      #endif
+      /* dont use unw_get_proc_name() here because it's too slow */
       if (unw_step(&cur) < 0) {
 	DBG(1, fprintf(stderr, "unw_step failed\n"));
 	break;
