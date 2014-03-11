@@ -1,6 +1,6 @@
 Summary: bulkdbg
 Name: bulkdbg
-Version: 0.0.10
+Version: 0.0.14
 Release: 1%{?dist}
 Group: System Environment/Libraries
 License: BSD
@@ -22,7 +22,6 @@ make
 rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT/%{_bindir}
 install -m 755 bulkdbg $RPM_BUILD_ROOT/%{_bindir}
-install -m 755 bulkdbg_threads $RPM_BUILD_ROOT/%{_bindir}
 
 %files
 %defattr(-, root, root)

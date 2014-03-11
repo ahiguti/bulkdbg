@@ -1,8 +1,15 @@
 
 // vim: ai sw=2
 
+/*
+  bulkdbg - tool for debugging multiple processes or threads
+  Copyright (c) Akira Higuchi
+  All rights reserved.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <errno.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
@@ -12,6 +19,7 @@
 #include <limits.h>
 #include <string.h>
 #include <sched.h>
+#include <dirent.h>
 #include <list>
 #include <vector>
 #include <map>
@@ -28,6 +36,7 @@
 #include <libunwind-ptrace.h>
 
 #include "syscall_table.hpp"
+#include "peekdata.hpp"
 
 #define DBG(v, x) if (debug_level >= v) { x; }
 
@@ -36,11 +45,25 @@
 #define BULKDBG_SP esp
 #define BULKDBG_FP ebp
 #define BULKDBG_ORIG_A orig_eax
+#define BULKDBG_A eax
+#define BULKDBG_ARG1 ebx
+#define BULKDBG_ARG2 ecx
+#define BULKDBG_ARG3 edx
+#define BULKDBG_ARG4 esi
+#define BULKDBG_ARG5 edi
+#define BULKDBG_ARG6 ebp
 #elif defined(__x86_64__)
 #define BULKDBG_IP rip
 #define BULKDBG_SP rsp
 #define BULKDBG_FP rbp
 #define BULKDBG_ORIG_A orig_rax
+#define BULKDBG_A rax
+#define BULKDBG_ARG1 rdi
+#define BULKDBG_ARG2 rsi
+#define BULKDBG_ARG3 rdx
+#define BULKDBG_ARG4 r10
+#define BULKDBG_ARG5 r8
+#define BULKDBG_ARG6 r9
 #else
 #error "unsupported cpu arch"
 #endif
@@ -54,17 +77,28 @@ struct syscall_info {
 };
 typedef std::vector<syscall_info> syscall_info_arr_type;
 
+struct examine_entry {
+  std::string funcname;
+  peekdata_data *pdata; /* TODO: leaks */
+};
+
 static int debug_level = 0;
 static int group_bt = 0;
 static int procstat = 0;
-static int trace_unw = 100;
 static int same_map = 0;
+static int trace_unw = 100;
 static int trace_fp = 0;
 static int trace_sp = 0;
 static int dump_sp = 0;
 static int dump_regs = 0;
 static int do_strace = 0;
 static int show_offset = 0;
+static int show_calls = 1;
+static int demangle_cxx = 1;
+static int show_threads = 0;
+static std::vector<examine_entry> exdata_list;
+static peekdata_data examine;
+static std::string calltrace_delim = ":";
 static syscall_info_arr_type syscall_info_arr;
 static syscall_info_arr_type socketcall_info_arr;
 
@@ -99,8 +133,15 @@ struct symbol_table {
   symbol_table() : text_vma(0), text_size(0) { }
 };
 
-static int load_symbol_table(const char *filename, symbol_table& st)
+static int load_symbol_table(const std::string& fn, symbol_table& st)
 {
+  std::string dbg_fn = "/usr/lib/debug" + fn + ".debug";
+  const char *filename = 0;
+  if (access(dbg_fn.c_str(), R_OK) == 0) {
+    filename = dbg_fn.c_str();
+  } else {
+    filename = fn.c_str();
+  }
   scoped_bfd abfd(filename);
   if (abfd.get() == 0) {
     DBG(1, fprintf(stderr, "failed to open %s\n", filename));
@@ -175,7 +216,7 @@ struct symbol_table_map {
       return i->second;
     }
     std::auto_ptr<symbol_table> p(new symbol_table);
-    if (load_symbol_table(path.c_str(), *p) != 0 || p->symbols.empty()) {
+    if (load_symbol_table(path, *p) != 0 || p->symbols.empty()) {
       p.reset();
     }
     m[path] = p.get(); /* can be 0 */
@@ -277,9 +318,6 @@ static bool check_shlib(const std::string& fn)
   if (elf == 0) {
     return false;
   }
-  #if 0
-  bool found = false;
-  #endif
   unsigned long vaddr = 0;
   #if defined(__i386__)
   Elf32_Ehdr *const ehdr = elf32_getehdr(elf);
@@ -301,9 +339,6 @@ static bool check_shlib(const std::string& fn)
     #endif
     if (p->p_type == PT_LOAD && (p->p_flags & 1) != 0) {
       vaddr = p->p_vaddr;
-      #if 0
-      found = true;
-      #endif
       break;
     }
   }
@@ -372,115 +407,8 @@ static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
   #endif
 }
 
-static int get_stack_trace_unw(unw_addr_space_t unw_as, int pid,
-  proc_info& pinfo, unsigned int maxlen, const user_regs_struct& regs,
+static int get_ipreg_procstat(int pid, proc_info& pinfo,
   std::vector<unsigned long>& vals_r)
-{
-  struct UPT_info *ui = (struct UPT_info *)_UPT_create(pid);
-  unw_cursor_t cur;
-  do {
-    if (unw_init_remote(&cur, unw_as, ui) < 0) {
-      DBG(0, fprintf(stderr, "unw_init_remote failed\n"));
-      break;
-    }
-    unw_word_t ip_prev = 0;
-    for (unsigned int i = 0; i < maxlen; ++i) {
-      unw_word_t ip, sp;
-      if (unw_get_reg(&cur, UNW_REG_IP, &ip) < 0) {
-	DBG(0, fprintf(stderr, "unw_get_reg ip failed\n"));
-	break;
-      }
-      DBG(10, fprintf(stderr, "ip=%lx\n", ip));
-      if (ip_prev == ip) {
-	break;
-      }
-      ip_prev = ip;
-      vals_r.push_back(ip);
-      if (unw_get_reg(&cur, UNW_REG_SP, &sp) < 0) {
-	DBG(0, fprintf(stderr, "unw_get_reg sp failed\n"));
-	break;
-      }
-      #if 0
-      {
-	char buf[256];
-	unw_word_t off = 0;
-	unw_get_proc_name(&cur, buf, sizeof(buf), &off);
-	//  DBG(0, fprintf(stderr, "unw_get_proc_name failed\n"));
-	//  break;
-	//}
-	// printf("IP %s(%lx)\n", buf, off);
-      }
-      #endif
-      #if 0
-      unw_proc_info_t pi;
-      if (unw_get_proc_info(&cur, &pi) < 0) {
-	DBG(0, fprintf(stderr, "unw_get_proc_info failed\n"));
-	break;
-      }
-      #endif
-      if (unw_step(&cur) < 0) {
-	DBG(1, fprintf(stderr, "unw_step failed\n"));
-	break;
-      }
-    } 
-  } while (0);
-  _UPT_destroy(ui);
-  return 0;
-}
-
-static int get_stack_trace(int pid, proc_info& pinfo, unsigned int maxlen,
-  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
-{
-  unsigned long ip = regs.BULKDBG_IP;
-  unsigned long fp = regs.BULKDBG_FP;
-  DBG(10, fprintf(stderr, "top ip=%lx\n", ip));
-  vals_r.push_back(ip);
-  unsigned int depth = 0;
-  while (fp != 0 && depth < maxlen) {
-    unsigned long prevfp = 0;
-    unsigned long retaddr = 0;
-    prevfp = ptrace(PTRACE_PEEKDATA, pid, fp, 0);
-    if (errno != 0) {
-      break;
-    }
-    retaddr = ptrace(PTRACE_PEEKDATA, pid, fp + sizeof(long), 0);
-    if (errno != 0) {
-      break;
-    }
-    DBG(10, fprintf(stderr, "ip=%lx fp=%lx\n", retaddr, prevfp));
-    if (pinfo.maps.empty()) {
-      continue;
-    }
-    vals_r.push_back(retaddr);
-    fp = prevfp;
-    ++depth;
-  }
-  return 0;
-}
-
-static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
-  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
-{
-  unsigned long sp = regs.BULKDBG_SP;
-  unsigned long ip = regs.BULKDBG_IP;
-  DBG(10, fprintf(stderr, "top ip=%lx\n", ip));
-  vals_r.push_back(ip);
-  unsigned int i = 0;
-  for (i = 0; i < maxlen; ++i) {
-    unsigned long retaddr = 0;
-    retaddr = ptrace(PTRACE_PEEKDATA, pid, sp + i * sizeof(long), 0);
-    if (errno != 0) {
-      break;
-    }
-    if (pinfo.maps.empty()) {
-      continue;
-    }
-    vals_r.push_back(retaddr);
-  }
-  return 0;
-}
-
-static int get_ipreg_procstat(int pid, proc_info& pinfo, std::vector<unsigned long>& vals_r)
 {
   char fn[1024];
   char buf[4096];
@@ -626,12 +554,12 @@ static std::string cxxdemangle(const char *s)
 
 static std::string examine_stack_trace(const proc_info& pinfo,
    const user_regs_struct& regs, const std::vector<unsigned long>& vals,
-   size_t maxlen)
+   size_t maxlen, const std::string& edata)
 {
   std::string rstr;
-  #if 0
-  rstr = ulong_to_str_hex(vals.size()); // FIXME
-  #endif
+  if (show_calls == 0) {
+    maxlen = 0;
+  }
   /* vals[0] is ip */
   for (size_t i = 0; i < std::min(vals.size(), maxlen); ++i) {
     unsigned long addr = vals[i];
@@ -639,17 +567,23 @@ static std::string examine_stack_trace(const proc_info& pinfo,
     const symbol_ent *e = pinfo_find_symbol(pinfo, addr, offset);
     if (e != 0) {
       const syscall_info *sinfo = 0;
+      #ifdef __i386__
       if (i == 0 && e->name == "_dl_sysinfo_int80" && offset == 2) { // TODO
         sinfo = find_syscall(regs);
       }
+      #endif
       if (offset != 0) {
 	if (!rstr.empty()) {
-	  rstr += ":";
+	  rstr += calltrace_delim;
 	}
 	if (sinfo != 0) {
 	  rstr += std::string(sinfo->name);
 	} else {
-	  rstr += cxxdemangle(e->name.c_str());
+	  if (demangle_cxx) {
+	    rstr += cxxdemangle(e->name.c_str());
+	  } else {
+	    rstr += e->name;
+	  }
 	}
 	if (show_offset) {
 	  char buf[32];
@@ -659,13 +593,29 @@ static std::string examine_stack_trace(const proc_info& pinfo,
       }
     } else if (offset != 0) {
       /* vdso */
-      if (i == 0 && offset == 0x410) { // TODO: correct?
+      if (i == 0 && offset == 0x410) { // TODO
         const syscall_info *sinfo = find_syscall(regs);
 	if (sinfo != 0) {
+	  if (!rstr.empty()) {
+	    rstr += calltrace_delim;
+	  }
 	  rstr += "(" + std::string(sinfo->name) + ")";
 	}
       }
+    } else {
+      char buf[32];
+      snprintf(buf, 32, "(%lx)", addr);
+      if (!rstr.empty()) {
+	rstr += calltrace_delim;
+      }
+      rstr += std::string(buf);
     }
+  }
+  if (!edata.empty()) {
+    if (!rstr.empty()) {
+      rstr += "\t";
+    }
+    rstr += edata;
   }
   return rstr;
 }
@@ -751,6 +701,187 @@ static void dump_user_regs(int pid, const user_regs_struct& regs)
   printf("%d\tr %s\n", pid, s.c_str());
 }
 
+static int get_stack_trace_unw(unw_addr_space_t unw_as,
+  struct UPT_info *saved_ui, int pid, proc_info& pinfo, unsigned int maxlen,
+  const user_regs_struct& regs, std::vector<unsigned long>& vals_r,
+  std::string& edata_r)
+{
+  struct UPT_info *ui = saved_ui;
+  if (saved_ui == 0) {
+    ui = (struct UPT_info *)_UPT_create(pid);
+  }
+  unw_cursor_t cur;
+  do {
+    if (unw_init_remote(&cur, unw_as, ui) < 0) {
+      DBG(0, fprintf(stderr, "unw_init_remote failed\n"));
+      break;
+    }
+    unw_word_t ip_prev = 0;
+    for (unsigned int i = 0; i < maxlen; ++i) {
+      unw_word_t ip, sp;
+      if (unw_get_reg(&cur, UNW_REG_IP, &ip) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_reg ip failed\n"));
+	break;
+      }
+      DBG(3, fprintf(stderr, "ip=%lx\n", ip));
+      if (ip_prev == ip || ip == 0) {
+	break;
+      }
+      ip_prev = ip;
+      vals_r.push_back(ip);
+      if (unw_get_reg(&cur, UNW_REG_SP, &sp) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_reg sp failed\n"));
+	break;
+      }
+      if (!exdata_list.empty()) {
+	unsigned long offset = 0;
+	const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
+	if (e != 0) {
+	  for (size_t i = 0; i < exdata_list.size(); ++i) {
+	    examine_entry& ee = exdata_list[i];
+	    if (ee.funcname == e->name) {
+	      peekdata_exec(*ee.pdata, sp, pid);
+	      if (!ee.pdata->err.empty()) {
+		DBG(0, fprintf(stderr, "peekdata failed: %s\n",
+		  ee.pdata->err.c_str()));
+	      } else {
+		edata_r += ee.pdata->buf;
+	      }
+	    }
+	  }
+	}
+      }
+      #if 0
+      // FIXME temp code
+      {
+	unsigned long offset = 0;
+	const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
+	if (e != 0 && e->name == "handle_one_connection") {
+	  fprintf(stderr, "rsp=%lx\n", sp);
+	  unsigned long thdp = ptrace(PTRACE_PEEKDATA, pid, sp + 24, 0);
+	  unsigned long thdid = ptrace(PTRACE_PEEKDATA, pid, thdp + 6400, 0);
+	  unsigned long qslen = ptrace(PTRACE_PEEKDATA, pid, thdp + 104, 0);
+	  unsigned long qsp = ptrace(PTRACE_PEEKDATA, pid, thdp + 96, 0);
+	  std::vector<char> buf(qslen + 1);
+	  for (unsigned long i = 0; i < qslen; i += sizeof(long)) {
+	    unsigned long v = ptrace(PTRACE_PEEKDATA, pid, qsp + i, 0);
+	    if (i + sizeof(long) <= qslen) {
+	      memcpy(&buf[i], &v, sizeof(long));
+	    } else {
+	      memcpy(&buf[i], &v, qslen - i);
+	    }
+	  }
+	  fprintf(stderr, "tid=%lu qlen=%d q=%s\n", thdid, (int)qslen, &buf[0]);
+	}
+      }
+      #endif
+      #if 0
+      // FIXME temp code
+      {
+	unsigned long offset = 0;
+	const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
+	if (e != 0 && e->name == "_Z24do_handle_one_connectionP3THD") {
+	  unsigned long thdp = ptrace(PTRACE_PEEKDATA, pid, sp + 8, 0);
+	  unsigned long thdid = ptrace(PTRACE_PEEKDATA, pid, thdp + 0x3230, 0);
+	  unsigned long qslen = ptrace(PTRACE_PEEKDATA, pid, thdp + 104, 0);
+	  unsigned long qsp = ptrace(PTRACE_PEEKDATA, pid, thdp + 96, 0);
+	  fprintf(stderr, "thdp=%lx qslen=%lu qsp=%lx\n", thdp, qslen, qsp);
+	  std::vector<char> buf(qslen + 1);
+	  for (unsigned short i = 0; i < qslen; i += sizeof(long)) {
+	    unsigned long v = ptrace(PTRACE_PEEKDATA, pid, qsp + i, 0);
+	    if (i + sizeof(long) <= qslen) {
+	      memcpy(&buf[i], &v, sizeof(long));
+	    } else {
+	      memcpy(&buf[i], &v, qslen - i);
+	    }
+	  }
+	  fprintf(stderr, "tid=%lu qlen=%d q=%s\n", thdid, (int)qslen, &buf[0]);
+	}
+      }
+      #endif
+      /* dont use unw_get_proc_name because it's too slow */
+      #if 0
+      {
+	char buf[256];
+	unw_word_t off = 0;
+	unw_get_proc_name(&cur, buf, sizeof(buf), &off);
+	//  DBG(0, fprintf(stderr, "unw_get_proc_name failed\n"));
+	//  break;
+	//}
+	// printf("IP %s(%lx)\n", buf, off);
+      }
+      #endif
+      #if 0
+      unw_proc_info_t pi;
+      if (unw_get_proc_info(&cur, &pi) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_proc_info failed\n"));
+	break;
+      }
+      #endif
+      if (unw_step(&cur) < 0) {
+	DBG(1, fprintf(stderr, "unw_step failed\n"));
+	break;
+      }
+    } 
+  } while (0);
+  if (saved_ui == 0) {
+    _UPT_destroy(ui);
+  }
+  return 0;
+}
+
+static int get_stack_trace(int pid, proc_info& pinfo, unsigned int maxlen,
+  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
+{
+  unsigned long ip = regs.BULKDBG_IP;
+  unsigned long fp = regs.BULKDBG_FP;
+  DBG(10, fprintf(stderr, "top ip=%lx\n", ip));
+  vals_r.push_back(ip);
+  unsigned int depth = 0;
+  while (fp != 0 && depth < maxlen) {
+    unsigned long prevfp = 0;
+    unsigned long retaddr = 0;
+    prevfp = ptrace(PTRACE_PEEKDATA, pid, fp, 0);
+    if (errno != 0) {
+      break;
+    }
+    retaddr = ptrace(PTRACE_PEEKDATA, pid, fp + sizeof(long), 0);
+    if (errno != 0) {
+      break;
+    }
+    DBG(10, fprintf(stderr, "ip=%lx fp=%lx\n", retaddr, prevfp));
+    if (pinfo.maps.empty()) {
+      continue;
+    }
+    vals_r.push_back(retaddr);
+    fp = prevfp;
+    ++depth;
+  }
+  return 0;
+}
+
+static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
+  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
+{
+  unsigned long sp = regs.BULKDBG_SP;
+  unsigned long ip = regs.BULKDBG_IP;
+  DBG(10, fprintf(stderr, "top ip=%lx\n", ip));
+  vals_r.push_back(ip);
+  unsigned int i = 0;
+  for (i = 0; i < maxlen; ++i) {
+    unsigned long retaddr = 0;
+    retaddr = ptrace(PTRACE_PEEKDATA, pid, sp + i * sizeof(long), 0);
+    if (errno != 0) {
+      break;
+    }
+    if (pinfo.maps.empty()) {
+      continue;
+    }
+    vals_r.push_back(retaddr);
+  }
+  return 0;
+}
+
 static int bulkdbg_pids(const std::vector<int>& pids)
 {
   unsigned int trace_length = 0;
@@ -775,6 +906,9 @@ static int bulkdbg_pids(const std::vector<int>& pids)
     if (!unw_as) {
       return -1;
     }
+    if (same_map) {
+      unw_set_caching_policy(unw_as, UNW_CACHE_GLOBAL);
+    }
   }
   int pid = -1;
   proc_info pinfo;
@@ -784,6 +918,7 @@ static int bulkdbg_pids(const std::vector<int>& pids)
   for (size_t i = 0; i < pids.size(); ++i) {
     pid = pids[i];
     std::vector<unsigned long> vals_fp, vals_sp;
+    std::string edata;
     user_regs_struct regs = { 0 };
     if (!same_map || stmap.empty()) {
       pinfo = proc_info();
@@ -802,7 +937,8 @@ static int bulkdbg_pids(const std::vector<int>& pids)
 	  failed = true;
 	} else {
 	  if (unwlength &&
-	    get_stack_trace_unw(unw_as, pid, pinfo, 100, regs, vals_fp) != 0) {
+	    get_stack_trace_unw(unw_as, 0, pid, pinfo, 100, regs, vals_fp,
+	      edata) != 0) {
 	    failed = true;
 	  }
 	  if (fplength &&
@@ -820,15 +956,15 @@ static int bulkdbg_pids(const std::vector<int>& pids)
     std::string tr;
     if (!failed) {
       if (procstat || trace_unw || trace_fp) {
-        tr = examine_stack_trace(pinfo, regs, vals_fp, trace_length);
+        tr = examine_stack_trace(pinfo, regs, vals_fp, trace_length, edata);
       } else {
-        tr = examine_stack_trace(pinfo, regs, vals_sp, trace_length);
+        tr = examine_stack_trace(pinfo, regs, vals_sp, trace_length, edata);
       }
     } else {
       tr = "[unknown]";
     }
     if (tr.empty()) {
-      tr = "[notfound]";
+      tr = "[nodata]";
     }
     if (group_bt == 0) {
       if (trace_sp != 0 || trace_fp != 0 || trace_unw != 0) {
@@ -907,6 +1043,17 @@ static void load_syscall_info()
 
 static int strace_proc(int pid)
 {
+  setvbuf(stdout, 0, _IONBF, 0);
+  unw_addr_space_t unw_as = 0;
+  struct UPT_info *saved_ui = 0;
+  if (trace_unw != 0) {
+    unw_as = unw_create_addr_space(&_UPT_accessors, 0);
+    if (!unw_as) {
+      return -1;
+    }
+    unw_set_caching_policy(unw_as, UNW_CACHE_GLOBAL);
+    saved_ui = (struct UPT_info *)_UPT_create(pid);
+  }
   DBG(100, fprintf(stderr, "strace %d\n", pid));
   int err = 0;
   if (ptrace_attach_proc(pid) != 0) {
@@ -920,6 +1067,12 @@ static int strace_proc(int pid)
   #endif
   int syscall_enter = 1;
   const syscall_info *sinfo_prev = 0;
+  std::vector<unsigned long> vals_fp;
+  std::string edata;
+  proc_info pinfo;
+  symbol_table_map stmap;
+  pinfo = proc_info();
+  read_maps(pid, pinfo, stmap);
   for (int i = 0; ; ++i, syscall_enter = !syscall_enter) {
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
       DBG(1, perror("ptrace(PTRACE_SYSCALL)"));
@@ -948,7 +1101,34 @@ static int strace_proc(int pid)
       syscall_enter = 1;
     }
     /* i386: ebx, ecx, edx, esi, edi */
-    printf("enter = %d syscall=%s\n", syscall_enter, syscall_name);
+    std::string tr;
+    if (trace_unw && syscall_enter != 0) {
+      vals_fp.clear();
+      edata.clear();
+      if (get_stack_trace_unw(unw_as, saved_ui, pid, pinfo, 100, regs, vals_fp,
+	edata) != 0) {
+	DBG(1, fprintf(stderr, "failed to get trace unw\n"));
+	err = -1;
+	break;
+      } else {
+        tr = examine_stack_trace(pinfo, regs, vals_fp, trace_unw, edata);
+      }
+    }
+    if (syscall_enter) {
+      long args[6] = {
+	regs.BULKDBG_ARG1,
+	regs.BULKDBG_ARG2,
+	regs.BULKDBG_ARG3,
+	regs.BULKDBG_ARG4,
+	regs.BULKDBG_ARG5,
+	regs.BULKDBG_ARG6
+      };
+      printf("%s %s(%lx %lx %lx %lx %lx %lx)", tr.c_str(), syscall_name,
+	args[0], args[1], args[2], args[3], args[4], args[5]);
+    } else {
+      long scret = regs.BULKDBG_A;
+      printf(" = %ld\n", scret);
+    }
     if (dump_regs) {
       dump_user_regs(pid, regs);
     }
@@ -960,10 +1140,34 @@ static int strace_proc(int pid)
     }
   }
   ptrace_detach_proc(pid);
+  if (saved_ui != 0) {
+    _UPT_destroy(saved_ui);
+  }
   return err;
 }
 
-static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
+static void get_thread_ids(int pid, std::vector<int>& pids_r)
+{
+  char buf[PATH_MAX];
+  snprintf(buf, sizeof(buf), "/proc/%d/task/", pid);
+  DIR *dir = opendir(buf);
+  if (dir == 0) {
+    return;
+  }
+  while (true) {
+    struct dirent *e = readdir(dir);
+    if (e == 0) {
+      break;
+    }
+    if (e->d_name[0] == '.') {
+      continue;
+    }
+    pids_r.push_back(atoi(e->d_name));
+  }
+  closedir(dir);
+}
+
+static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
 {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -976,22 +1180,45 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
         debug_level = vint;
       } else if (k == "group") {
         group_bt = vint;
-      } else if (k == "unwtrace" || k == "fptrace") {
+      } else if (k == "unwtrace") {
         trace_unw = vint;
         trace_fp = 0;
         trace_sp = 0;
-      #if 0
       } else if (k == "fptrace") {
         trace_fp = vint;
         trace_unw = 0;
         trace_sp = 0;
-      #endif
+	#if defined(__x86_64__)
+        trace_unw = vint;
+        trace_fp = 0;
+	#endif
       } else if (k == "procstat") {
 	procstat = vint;
       } else if (k == "sptrace") {
         trace_sp = vint;
         trace_fp = 0;
         trace_unw = 0;
+      } else if (k == "showcalls") {
+	show_calls = vint;
+      } else if (k == "examine") {
+	std::string s = v;
+	std::string::size_type i = s.find(':');
+	if (i == s.npos) {
+	  fprintf(stderr, "Examine: syntax error: %s\n", s.c_str());
+	  return 2;
+	}
+	std::string fn = s.substr(0, i);
+	s = s.substr(i + 1);
+	std::string src = s;
+	exdata_list.push_back(examine_entry());
+	examine_entry& ee = exdata_list.back();
+	ee.funcname = fn;
+	ee.pdata = new peekdata_data();
+	peekdata_init(*ee.pdata, src);
+	if (!ee.pdata->err.empty()) {
+	  fprintf(stderr, "Peekdata: %s\n", ee.pdata->err.c_str());
+	  return 2;
+	}
       } else if (k == "spdump") {
         dump_sp = vint;
       } else if (k == "regs") {
@@ -1000,34 +1227,59 @@ static void parse_options(int argc, char **argv, std::vector<int>& pids_r)
         do_strace = vint;
       } else if (k == "offset") {
         show_offset = vint;
+      #if 0
       } else if (k == "samemap") {
 	same_map = vint;
+      #endif
+      } else if (k == "allthreads") {
+	show_threads = vint;
+      } else if (k == "demangle") {
+	demangle_cxx = vint;
+	calltrace_delim = ";";
       }
     } else {
       pids_r.push_back(atoi(argv[i]));
     }
   }
+  if (show_threads) {
+    if (pids_r.size() > 1) {
+      fprintf(stderr, "Can not debug multiple processes when allthreads=1\n");
+      return 2;
+    } else if (pids_r.size() == 1) {
+      int pid = pids_r[0];
+      pids_r.clear();
+      get_thread_ids(pid, pids_r);
+    }
+    same_map = 1;
+  }
+  return 0;
 }
 
 static int usage(const char *argv0)
 {
   fprintf(stderr,
     "Usage: \n"
-    "  %s [OPTIONS] PROCESS_OR_THREAD_ID [...]\n", argv0);
+    "  %s [OPTIONS] PID [PIDS ...]\n", argv0);
   fprintf(stderr,
     "Options: \n"
+    "  allthreads=0        - trace all threads\n"
     "  offset=0         - show ip offset for each frame\n"
     "  debug=0          - show debug message\n"
     "  group=0          - group processes/threads by stack trace\n"
     "  regs=0           - show registers\n"
+    "  fptrace=100      - number of frames to trace\n"
     #if 0
-    "  fptrace=100      - show stack trace for each process/thread\n"
-    "  unwtrace=0       - ???\n"
+    "  fptrace=100      - get stack trace using saved frame pointer values\n"
+    "  unwtrace=0       - get stack trace using libunwind\n"
+    "  sptrace=0        - get stack trace using a heuristic method\n"
     #endif
-    "  sptrace=0        - ???\n"
-    "  spdump=0         - ???\n"
-    "  procstat=0       - ???\n"
-    "  strace=0         - ???\n");
+    "  examine=FUNC:OPS - examine data\n"
+    "  showcalls=1      - show call trace\n"
+    "  demangle=1       - demangle c++ symbols\n"
+    "  samemap=0        - \n"
+    "  spdump=0         - \n"
+    "  procstat=0       - \n"
+    "  strace=0         - \n");
   return 1;
 }
 
@@ -1037,9 +1289,11 @@ int main(int argc, char **argv)
     return usage(argv[0]);
   }
   std::vector<int> pids;
-  parse_options(argc, argv, pids);
+  if (parse_options(argc, argv, pids) != 0) {
+    return 2;
+  }
   if (pids.size() == 0) {
-    return 0;
+    return usage(argv[0]);
   }
   load_syscall_info();
   if (do_strace != 0) {
