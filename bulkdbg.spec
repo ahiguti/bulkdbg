@@ -1,6 +1,6 @@
 Summary: bulkdbg
 Name: bulkdbg
-Version: 0.0.14
+Version: 0.0.15
 Release: 1%{?dist}
 Group: System Environment/Libraries
 License: BSD

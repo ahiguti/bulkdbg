@@ -78,7 +78,10 @@ struct syscall_info {
 typedef std::vector<syscall_info> syscall_info_arr_type;
 
 struct examine_entry {
+  examine_entry() : offset(0) { }
+  std::string upfuncname;
   std::string funcname;
+  size_t offset;
   peekdata_data *pdata; /* TODO: leaks */
 };
 
@@ -711,6 +714,7 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
     ui = (struct UPT_info *)_UPT_create(pid);
   }
   unw_cursor_t cur;
+  std::string upfn;
   do {
     if (unw_init_remote(&cur, unw_as, ui) < 0) {
       DBG(0, fprintf(stderr, "unw_init_remote failed\n"));
@@ -739,7 +743,9 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 	if (e != 0) {
 	  for (size_t i = 0; i < exdata_list.size(); ++i) {
 	    examine_entry& ee = exdata_list[i];
-	    if (ee.funcname == e->name) {
+	    if (ee.funcname == e->name &&
+	      (ee.offset == 0 || ee.offset == offset) &&
+	      (ee.upfuncname.empty() || ee.upfuncname == upfn)) {
 	      peekdata_exec(*ee.pdata, sp, pid);
 	      if (!ee.pdata->err.empty()) {
 		DBG(0, fprintf(stderr, "peekdata failed: %s\n",
@@ -749,9 +755,28 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 	      }
 	    }
 	  }
+	  upfn = e->name;
 	}
       }
-      /* dont use unw_get_proc_name() here because it's too slow */
+      /* dont use unw_get_proc_name because it's too slow */
+      #if 0
+      {
+	char buf[256];
+	unw_word_t off = 0;
+	unw_get_proc_name(&cur, buf, sizeof(buf), &off);
+	//  DBG(0, fprintf(stderr, "unw_get_proc_name failed\n"));
+	//  break;
+	//}
+	// printf("IP %s(%lx)\n", buf, off);
+      }
+      #endif
+      #if 0
+      unw_proc_info_t pi;
+      if (unw_get_proc_info(&cur, &pi) < 0) {
+	DBG(0, fprintf(stderr, "unw_get_proc_info failed\n"));
+	break;
+      }
+      #endif
       if (unw_step(&cur) < 0) {
 	DBG(1, fprintf(stderr, "unw_step failed\n"));
 	break;
@@ -1135,18 +1160,31 @@ static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
       } else if (k == "showcalls") {
 	show_calls = vint;
       } else if (k == "examine") {
-	std::string s = v;
+	const std::string s = v;
 	std::string::size_type i = s.find(':');
 	if (i == s.npos) {
 	  fprintf(stderr, "Examine: syntax error: %s\n", s.c_str());
 	  return 2;
 	}
 	std::string fn = s.substr(0, i);
-	s = s.substr(i + 1);
-	std::string src = s;
+	size_t offset = 0;
+	std::string src = s.substr(i + 1);
+	std::string upfn;
+	i = fn.find(',');
+	if (i != fn.npos) {
+	  upfn = fn.substr(0, i);
+	  fn = fn.substr(i + 1);
+	}
+	i = fn.find('+');
+	if (i != fn.npos) {
+	  offset = strtoull(fn.c_str() + i + 1, 0, 0);
+	  fn = fn.substr(0, i);
+	}
 	exdata_list.push_back(examine_entry());
 	examine_entry& ee = exdata_list.back();
+	ee.upfuncname = upfn;
 	ee.funcname = fn;
+	ee.offset = offset;
 	ee.pdata = new peekdata_data();
 	peekdata_init(*ee.pdata, src);
 	if (!ee.pdata->err.empty()) {

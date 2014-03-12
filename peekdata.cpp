@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
 #include <functional>
 
 #include "peekdata.hpp"
@@ -113,7 +115,7 @@ template <bool conditional> struct peekdata_op_jmp : peekdata_op {
       }
     }
     dt.curop += offset;
-    return true;
+    return offset != 0;
   }
 };
 
@@ -159,26 +161,78 @@ struct peekdata_op_out_string : peekdata_op {
       return false;
     }
     if (!dt.buf.empty()) {
-      dt.buf.push_back('\t');
+      dt.buf += "\t";
     }
     unsigned long addr = dt.stk[dt.stk.size() - 2];
-    unsigned long orig_len = dt.stk[dt.stk.size() - 1];
-    unsigned long len = orig_len;
-    if (orig_len > dt.string_limit) {
-      len = dt.string_limit;
-    }
-    char buf[sizeof(long)];
-    for (unsigned long i = 0; i < len; i += sizeof(long)) {
-      *reinterpret_cast<unsigned long *>(buf) = ptrace(PTRACE_PEEKDATA,
-	dt.pid, addr + i, 0);
-      if (i + sizeof(long) <= len) {
-	dt.buf.insert(dt.buf.end(), buf, buf + sizeof(long));
-      } else {
-	dt.buf.insert(dt.buf.end(), buf, buf + (len - i));
+    if (addr != 0) {
+      dt.buf += "\"";
+      unsigned long orig_len = dt.stk[dt.stk.size() - 1];
+      unsigned long len = orig_len;
+      if (orig_len > dt.string_limit) {
+	len = dt.string_limit;
       }
+      char buf[sizeof(long)] = { 0 };
+      for (unsigned long i = 0; i < len; i += sizeof(long)) {
+	*reinterpret_cast<unsigned long *>(buf) = ptrace(PTRACE_PEEKDATA,
+	  dt.pid, addr + i, 0);
+	if (errno != 0) {
+	  break;
+	}
+	if (i + sizeof(long) <= len) {
+	  dt.buf.insert(dt.buf.end(), buf, buf + sizeof(long));
+	} else {
+	  dt.buf.insert(dt.buf.end(), buf, buf + (len - i));
+	}
+      }
+      if (orig_len > dt.string_limit) {
+	dt.buf += "...";
+      }
+      dt.buf += "\"";
+    } else {
+      dt.buf += "null";
     }
-    if (orig_len > dt.string_limit) {
-      dt.buf += "...";
+    return true;
+  }
+};
+
+struct peekdata_op_out_nulterm_string : peekdata_op {
+  bool exec(peekdata_data& dt) {
+    if (dt.stk.empty()) {
+      return false;
+    }
+    if (!dt.buf.empty()) {
+      dt.buf += "\t";
+    }
+    unsigned long addr = dt.stk[dt.stk.size() - 1];
+    if (addr != 0) {
+      dt.buf += "\"";
+      unsigned long len_limit = dt.string_limit;
+      char buf[sizeof(long)] = { 0 };
+      bool found_nul = false;
+      for (unsigned long i = 0; i < len_limit; i += sizeof(long)) {
+	*reinterpret_cast<unsigned long *>(buf) = ptrace(PTRACE_PEEKDATA,
+	  dt.pid, addr + i, 0);
+	if (errno != 0) {
+	  break;
+	}
+	size_t mlen = std::min(len_limit - i, sizeof(long));
+	char *const p = static_cast<char *>(memchr(buf, 0, sizeof(long)));
+	size_t xlen = p - buf;
+	if (p != 0 && xlen <= mlen) {
+	  mlen = xlen;
+	  found_nul = true;
+	}
+	dt.buf.insert(dt.buf.end(), buf, buf + mlen);
+	if (p != 0) {
+	  break;
+	}
+      }
+      if (!found_nul) {
+	dt.buf += "...";
+      }
+      dt.buf += "\"";
+    } else {
+      dt.buf += "null";
     }
     return true;
   }
@@ -246,6 +300,8 @@ make_peekdata_ops(peekdata_data& dt, const std::string& s)
       op = new peekdata_op_out_hexadecimal();
     } else if (src == "outs") {
       op = new peekdata_op_out_string();
+    } else if (src == "outsz") {
+      op = new peekdata_op_out_nulterm_string();
     } else if (src.substr(0, 2) == "cp") {
       op = new peekdata_op_copy(strtoul(src.c_str() + 2, 0, 0));
     } else if (src.substr(0, 2) == "po") {
