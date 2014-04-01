@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 
 struct peekdata_ops;
 typedef std::vector<unsigned long> peekdata_stack;
@@ -21,6 +22,7 @@ struct peekdata_data {
   size_t exec_limit;
   size_t string_limit;
   bool trace_flag;
+  std::map<std::string, unsigned long> syms;
 };
 
 void peekdata_init(peekdata_data& dt, const std::string& s);

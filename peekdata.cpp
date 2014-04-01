@@ -42,6 +42,7 @@ private:
 };
 
 struct peekdata_op_ulong : peekdata_op {
+  /* push 1 */
   unsigned long value;
   peekdata_op_ulong(unsigned long v) : value(v) { }
   bool exec(peekdata_data& dt) {
@@ -50,35 +51,56 @@ struct peekdata_op_ulong : peekdata_op {
   }
 };
 
-template <typename f, bool is_divop> struct peekdata_op_binop : peekdata_op {
+struct peekdata_op_sym : peekdata_op {
+  /* push 1 */
+  std::string symstr;
+  peekdata_op_sym(const std::string& s) : symstr(s) { }
   bool exec(peekdata_data& dt) {
+    dt.stk.push_back(dt.syms[symstr]);
+    return true;
+  }
+};
+
+template <typename f, bool is_divop> struct peekdata_op_binop : peekdata_op {
+  /* pop 2, push 1 */
+  bool exec(peekdata_data& dt) {
+    const size_t sz = dt.stk.size();
     if (dt.stk.size() < 2) {
       return false;
     }
-    unsigned long v0 = dt.stk[dt.stk.size() - 2];
-    unsigned long v1 = dt.stk[dt.stk.size() - 1];
+    unsigned long v0 = dt.stk[sz - 2];
+    unsigned long v1 = dt.stk[sz - 1];
     if (is_divop && v1 == 0) {
       return false;
     }
     unsigned long v = f()(v0, v1);
-    dt.stk.push_back(v);
+    dt.stk.pop_back();
+    dt.stk[sz - 2] = v;
     return true;
   }
 };
 
 struct peekdata_op_peek : peekdata_op {
+  /* pop 1, push 1 */
+  unsigned long size;
+  peekdata_op_peek(int sz) : size(sz) { }
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
     }
     unsigned long addr = dt.stk[dt.stk.size() - 1];
     unsigned long val = ptrace(PTRACE_PEEKDATA, dt.pid, addr, 0);
-    dt.stk.push_back(val);
+    if (size != 0) {
+      const unsigned long mask = (1UL << (size * 8)) - 1;
+      val &= mask;
+    }
+    dt.stk[dt.stk.size() - 1] = val;
     return true;
   }
 };
 
 struct peekdata_op_copy : peekdata_op {
+  /* push 1 */
   unsigned long offset;
   peekdata_op_copy(int o) : offset(o) { }
   bool exec(peekdata_data& dt) {
@@ -92,6 +114,7 @@ struct peekdata_op_copy : peekdata_op {
 };
 
 struct peekdata_op_pop : peekdata_op {
+  /* pop n */
   unsigned long length;
   peekdata_op_pop(unsigned long len) : length(len) { }
   bool exec(peekdata_data& dt) {
@@ -99,18 +122,23 @@ struct peekdata_op_pop : peekdata_op {
     if (sz < length) {
       return false;
     }
-    dt.popval = sz > 0 ? dt.stk[sz - 1] : 0;
     dt.stk.resize(sz - length);
     return true;
   }
 };
 
 template <bool conditional> struct peekdata_op_jmp : peekdata_op {
+  /* pop 1 if conditional */
   long offset;
   peekdata_op_jmp(long o) : offset(o) { }
   bool exec(peekdata_data& dt) {
     if (conditional) {
-      if (dt.popval == 0) {
+      if (dt.stk.empty()) {
+	return false;
+      }
+      unsigned long val = dt.stk[dt.stk.size() - 1];
+      dt.stk.pop_back();
+      if (val == 0) {
 	return true;
       }
     }
@@ -120,6 +148,7 @@ template <bool conditional> struct peekdata_op_jmp : peekdata_op {
 };
 
 struct peekdata_op_out_decimal : peekdata_op {
+  /* pop 1 */
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
@@ -133,11 +162,13 @@ struct peekdata_op_out_decimal : peekdata_op {
     if (sz > 0) {
       dt.buf.insert(dt.buf.end(), buf, buf + sz);
     }
+    dt.stk.pop_back();
     return true;
   }
 };
 
 struct peekdata_op_out_hexadecimal : peekdata_op {
+  /* pop 1 */
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
@@ -151,11 +182,13 @@ struct peekdata_op_out_hexadecimal : peekdata_op {
     if (sz > 0) {
       dt.buf.insert(dt.buf.end(), buf, buf + sz);
     }
+    dt.stk.pop_back();
     return true;
   }
 };
 
 struct peekdata_op_out_string : peekdata_op {
+  /* pop 2 */
   bool exec(peekdata_data& dt) {
     if (dt.stk.size() < 2) {
       return false;
@@ -191,11 +224,13 @@ struct peekdata_op_out_string : peekdata_op {
     } else {
       dt.buf += "null";
     }
+    dt.stk.resize(dt.stk.size() - 2);
     return true;
   }
 };
 
 struct peekdata_op_out_nulterm_string : peekdata_op {
+  /* pop 1 */
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
@@ -234,6 +269,7 @@ struct peekdata_op_out_nulterm_string : peekdata_op {
     } else {
       dt.buf += "null";
     }
+    dt.stk.pop_back();
     return true;
   }
 };
@@ -260,9 +296,7 @@ make_peekdata_ops(peekdata_data& dt, const std::string& s)
       return;
     }
     peekdata_op *op = 0;
-    if (src == "ld") {
-      op = new peekdata_op_peek();
-    } else if (src == "add") {
+    if (src == "add") {
       op = new peekdata_op_binop<std::plus<unsigned long>, false>();
     } else if (src == "sub") {
       op = new peekdata_op_binop<std::minus<unsigned long>, false>();
@@ -302,6 +336,8 @@ make_peekdata_ops(peekdata_data& dt, const std::string& s)
       op = new peekdata_op_out_string();
     } else if (src == "outsz") {
       op = new peekdata_op_out_nulterm_string();
+    } else if (src.substr(0, 2) == "ld") {
+      op = new peekdata_op_peek(strtoul(src.c_str() + 2, 0, 0));
     } else if (src.substr(0, 2) == "cp") {
       op = new peekdata_op_copy(strtoul(src.c_str() + 2, 0, 0));
     } else if (src.substr(0, 2) == "po") {
@@ -312,6 +348,10 @@ make_peekdata_ops(peekdata_data& dt, const std::string& s)
       op = new peekdata_op_jmp<true>(strtol(src.c_str() + 2, 0, 0));
     } else if (src[0] >= '0' && src[0] <= '9') {
       op = new peekdata_op_ulong(strtoul(src.c_str(), 0, 0));
+    } else if (src[0] == '@') {
+      std::string symstr(src.c_str() + 1);
+      dt.syms[symstr];
+      op = new peekdata_op_sym(symstr);
     } else if (src == "tr") {
       dt.trace_flag = true;
     } else if (src.substr(0, 4) == "elim") {
