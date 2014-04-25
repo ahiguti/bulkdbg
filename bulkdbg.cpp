@@ -138,11 +138,61 @@ struct symbol_table {
   symbols_type symbols;
   unsigned long text_vma;
   unsigned long text_size;
-  symbol_table() : text_vma(0), text_size(0) { }
+  bool is_relative;
+  symbol_table() : text_vma(0), text_size(0), is_relative(false) { }
 };
 
+struct auto_fp {
+  explicit auto_fp(FILE *fp) : fp(fp) { }
+  ~auto_fp() { if (fp) { fclose(fp); } }
+  operator FILE *() { return fp; }
+private:
+  FILE *fp;
+  auto_fp(const auto_fp&);
+  auto_fp& operator =(const auto_fp&);
+};
+
+static bool check_shlib(const std::string& fn)
+{
+  auto_fp fp(fopen(fn.c_str(), "r"));
+  if (fp == 0) {
+    return false;
+  }
+  elf_version(EV_CURRENT);
+  Elf *elf = elf_begin(fileno(fp), ELF_C_READ, NULL);
+  if (elf == 0) {
+    return false;
+  }
+  unsigned long vaddr = 0;
+  #if defined(__i386__)
+  Elf32_Ehdr *const ehdr = elf32_getehdr(elf);
+  Elf32_Phdr *const phdr = elf32_getphdr(elf);
+  #else
+  Elf64_Ehdr *const ehdr = elf64_getehdr(elf);
+  Elf64_Phdr *const phdr = elf64_getphdr(elf);
+  #endif
+  if (ehdr == 0 || phdr == 0) {
+    /* TODO: support Elf32 on x86_64 */
+    return false;
+  }
+  const int num_phdr = ehdr->e_phnum;
+  for (int i = 0; i < num_phdr; ++i) {
+    #if defined(__i386__)
+    Elf32_Phdr *const p = phdr + i;
+    #else
+    Elf64_Phdr *const p = phdr + i;
+    #endif
+    if (p->p_type == PT_LOAD && (p->p_flags & 1) != 0) {
+      vaddr = p->p_vaddr;
+      break;
+    }
+  }
+  elf_end(elf);
+  return vaddr == 0;
+}
+
 static int load_symbol_table(const std::string& fn, symbol_table& st,
-  bool is_relative, unsigned long addr_begin)
+  unsigned long addr_begin)
 {
   std::string dbg_fn = "/usr/lib/debug" + fn + ".debug";
   const char *filename = 0;
@@ -151,6 +201,7 @@ static int load_symbol_table(const std::string& fn, symbol_table& st,
   } else {
     filename = fn.c_str();
   }
+  st.is_relative = check_shlib(filename);
   scoped_bfd abfd(filename);
   if (abfd.get() == 0) {
     DBG(1, fprintf(stderr, "failed to open %s\n", filename));
@@ -197,7 +248,7 @@ static int load_symbol_table(const std::string& fn, symbol_table& st,
     if (!peekdata_syms.empty() &&
       peekdata_syms.find(symstr) != peekdata_syms.end()) {
       unsigned long absval = sinfo.value;
-      if (is_relative) {
+      if (st.is_relative) {
 	absval += addr_begin;
       }
       peekdata_syms[symstr] = absval;
@@ -230,14 +281,13 @@ struct symbol_table_map {
       delete i->second;
     }
   }
-  symbol_table *get(const std::string& path, bool is_relative,
-    unsigned long addr_begin) {
+  symbol_table *get(const std::string& path, unsigned long addr_begin) {
     m_type::iterator i = m.find(path);
     if (i != m.end()) {
       return i->second;
     }
     std::auto_ptr<symbol_table> p(new symbol_table);
-    if (load_symbol_table(path, *p, is_relative, addr_begin) != 0 ||
+    if (load_symbol_table(path, *p, addr_begin) != 0 ||
       p->symbols.empty()) {
       p.reset();
     }
@@ -320,55 +370,6 @@ struct proc_info {
   maps_type maps;
 };
 
-struct auto_fp {
-  explicit auto_fp(FILE *fp) : fp(fp) { }
-  ~auto_fp() { if (fp) { fclose(fp); } }
-  operator FILE *() { return fp; }
-private:
-  FILE *fp;
-  auto_fp(const auto_fp&);
-  auto_fp& operator =(const auto_fp&);
-};
-
-static bool check_shlib(const std::string& fn)
-{
-  auto_fp fp(fopen(fn.c_str(), "r"));
-  if (fp == 0) {
-    return false;
-  }
-  elf_version(EV_CURRENT);
-  Elf *elf = elf_begin(fileno(fp), ELF_C_READ, NULL);
-  if (elf == 0) {
-    return false;
-  }
-  unsigned long vaddr = 0;
-  #if defined(__i386__)
-  Elf32_Ehdr *const ehdr = elf32_getehdr(elf);
-  Elf32_Phdr *const phdr = elf32_getphdr(elf);
-  #else
-  Elf64_Ehdr *const ehdr = elf64_getehdr(elf);
-  Elf64_Phdr *const phdr = elf64_getphdr(elf);
-  #endif
-  if (ehdr == 0 || phdr == 0) {
-    /* TODO: support Elf32 on x86_64 */
-    return false;
-  }
-  const int num_phdr = ehdr->e_phnum;
-  for (int i = 0; i < num_phdr; ++i) {
-    #if defined(__i386__)
-    Elf32_Phdr *const p = phdr + i;
-    #else
-    Elf64_Phdr *const p = phdr + i;
-    #endif
-    if (p->p_type == PT_LOAD && (p->p_flags & 1) != 0) {
-      vaddr = p->p_vaddr;
-      break;
-    }
-  }
-  elf_end(elf);
-  return vaddr == 0;
-}
-
 static void read_proc_map_ent(char *line, proc_info& pinfo,
   symbol_table_map& stmap)
 {
@@ -401,20 +402,9 @@ static void read_proc_map_ent(char *line, proc_info& pinfo,
   if (e.path == "[vdso]" || e.path == "[vsyscall]") {
     e.is_vdso = true;
   } else {
-    /* wrong? */
-    e.relative = check_shlib(e.path);
-    DBG(10, fprintf(stderr, "%s: relative=%d addr_begin=%lx\n", e.path.c_str(),
-      (int)e.relative, e.addr_begin));
-    e.stbl = stmap.get(e.path, e.relative, e.addr_begin);
+    e.stbl = stmap.get(e.path, e.addr_begin);
+    e.relative = e.stbl->is_relative;
   }
-  #if 0
-  if (e.stbl != 0) {
-    /* wrong? */
-    e.relative = check_shlib(e.path);
-    DBG(10, fprintf(stderr, "%s: relative=%d addr_begin=%lx\n", e.path.c_str(),
-      (int)e.relative, e.addr_begin));
-  }
-  #endif
   std::string bpath = e.path;
   std::string::size_type sl = bpath.rfind('/');
   if (sl != bpath.npos) {
@@ -823,7 +813,13 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 		DBG(0, fprintf(stderr, "peekdata failed: %s\n",
 		  ee.pdata->err.c_str()));
 	      } else {
-		edata_r += ee.pdata->buf;
+		const std::vector<std::string>& buf = ee.pdata->buffer;
+		for (size_t i = 0; i < buf.size(); ++i) {
+		  if (!edata_r.empty()) {
+		    edata_r += "\t";
+		  }
+		  edata_r += buf[i];
+		}
 	      }
 	    }
 	  }

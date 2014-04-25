@@ -41,6 +41,38 @@ private:
   peekdata_ops& operator =(const peekdata_ops&);
 };
 
+static void peekdata_out(std::vector<std::string>& buf,
+  const std::string& s, long pos)
+{
+  if (pos < 0) {
+    buf.push_back(s);
+  } else if (pos < 65536) {
+    const size_t i = static_cast<size_t>(pos);
+    if (buf.size() < i) {
+      buf.resize(i + 1);
+      buf[i] = s;
+    }
+  }
+}
+
+static std::string peekdata_in(const std::vector<std::string>& buf, long pos)
+{
+  if (pos < 0) {
+    if (buf.empty()) {
+      return std::string();
+    } else {
+      return buf[buf.size() - 1];
+    }
+  } else {
+    const size_t i = static_cast<size_t>(pos);
+    if (i < buf.size()) {
+      return buf[i];
+    } else {
+      return std::string();
+    }
+  }
+}
+
 struct peekdata_op_ulong : peekdata_op {
   /* push 1 */
   unsigned long value;
@@ -149,18 +181,17 @@ template <bool conditional> struct peekdata_op_jmp : peekdata_op {
 
 struct peekdata_op_out_decimal : peekdata_op {
   /* pop 1 */
+  long offset;
+  peekdata_op_out_decimal(long o) : offset(o) { }
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
-    }
-    if (!dt.buf.empty()) {
-      dt.buf.push_back('\t');
     }
     unsigned long val = dt.stk[dt.stk.size() - 1];
     char buf[32];
     size_t sz = snprintf(buf, sizeof(buf), "%lu", val);
     if (sz > 0) {
-      dt.buf.insert(dt.buf.end(), buf, buf + sz);
+      peekdata_out(dt.buffer, std::string(buf), offset);
     }
     dt.stk.pop_back();
     return true;
@@ -169,18 +200,17 @@ struct peekdata_op_out_decimal : peekdata_op {
 
 struct peekdata_op_out_hexadecimal : peekdata_op {
   /* pop 1 */
+  long offset;
+  peekdata_op_out_hexadecimal(long o) : offset(o) { }
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
-    }
-    if (!dt.buf.empty()) {
-      dt.buf.push_back('\t');
     }
     unsigned long val = dt.stk[dt.stk.size() - 1];
     char buf[32];
     size_t sz = snprintf(buf, sizeof(buf), "%lx", val);
     if (sz > 0) {
-      dt.buf.insert(dt.buf.end(), buf, buf + sz);
+      peekdata_out(dt.buffer, std::string(buf), offset);
     }
     dt.stk.pop_back();
     return true;
@@ -189,16 +219,16 @@ struct peekdata_op_out_hexadecimal : peekdata_op {
 
 struct peekdata_op_out_string : peekdata_op {
   /* pop 2 */
+  long offset;
+  peekdata_op_out_string(long o) : offset(o) { }
   bool exec(peekdata_data& dt) {
     if (dt.stk.size() < 2) {
       return false;
     }
-    if (!dt.buf.empty()) {
-      dt.buf += "\t";
-    }
     unsigned long addr = dt.stk[dt.stk.size() - 2];
+    std::string obuf;
     if (addr != 0) {
-      dt.buf += "\"";
+      obuf += "\"";
       unsigned long orig_len = dt.stk[dt.stk.size() - 1];
       unsigned long len = orig_len;
       if (orig_len > dt.string_limit) {
@@ -212,35 +242,60 @@ struct peekdata_op_out_string : peekdata_op {
 	  break;
 	}
 	if (i + sizeof(long) <= len) {
-	  dt.buf.insert(dt.buf.end(), buf, buf + sizeof(long));
+	  obuf.insert(obuf.end(), buf, buf + sizeof(long));
 	} else {
-	  dt.buf.insert(dt.buf.end(), buf, buf + (len - i));
+	  obuf.insert(obuf.end(), buf, buf + (len - i));
 	}
       }
       if (orig_len > dt.string_limit) {
-	dt.buf += "...";
+	obuf += "...";
       }
-      dt.buf += "\"";
+      obuf += "\"";
     } else {
-      dt.buf += "null";
+      obuf += "null";
     }
+    peekdata_out(dt.buffer, obuf, offset);
     dt.stk.resize(dt.stk.size() - 2);
+    return true;
+  }
+};
+
+struct peekdata_op_in_decimal : peekdata_op {
+  /* push 1 */
+  long offset;
+  peekdata_op_in_decimal(long o) : offset(o) { }
+  bool exec(peekdata_data& dt) {
+    const std::string s = peekdata_in(dt.buffer, offset);
+    unsigned long v = strtoul(s.c_str(), 0, 0);
+    dt.stk.push_back(v);
+    return true;
+  }
+};
+
+struct peekdata_op_in_hexadecimal : peekdata_op {
+  /* push 1 */
+  long offset;
+  peekdata_op_in_hexadecimal(long o) : offset(o) { }
+  bool exec(peekdata_data& dt) {
+    const std::string s = peekdata_in(dt.buffer, offset);
+    unsigned long v = strtoul(s.c_str(), 0, 16);
+    dt.stk.push_back(v);
     return true;
   }
 };
 
 struct peekdata_op_out_nulterm_string : peekdata_op {
   /* pop 1 */
+  long offset;
+  peekdata_op_out_nulterm_string(long o) : offset(o) { }
   bool exec(peekdata_data& dt) {
     if (dt.stk.empty()) {
       return false;
     }
-    if (!dt.buf.empty()) {
-      dt.buf += "\t";
-    }
+    std::string obuf;
     unsigned long addr = dt.stk[dt.stk.size() - 1];
     if (addr != 0) {
-      dt.buf += "\"";
+      obuf += "\"";
       unsigned long len_limit = dt.string_limit;
       char buf[sizeof(long)] = { 0 };
       bool found_nul = false;
@@ -257,22 +312,31 @@ struct peekdata_op_out_nulterm_string : peekdata_op {
 	  mlen = xlen;
 	  found_nul = true;
 	}
-	dt.buf.insert(dt.buf.end(), buf, buf + mlen);
+	obuf.insert(obuf.end(), buf, buf + mlen);
 	if (p != 0) {
 	  break;
 	}
       }
       if (!found_nul) {
-	dt.buf += "...";
+	obuf += "...";
       }
-      dt.buf += "\"";
+      obuf += "\"";
     } else {
-      dt.buf += "null";
+      obuf += "null";
     }
+    peekdata_out(dt.buffer, obuf, offset);
     dt.stk.pop_back();
     return true;
   }
 };
+
+static long read_longval(const std::string& s, size_t offset)
+{
+  if (s.size() >= offset) {
+    return -1;
+  }
+  return strtoul(s.c_str() + offset, 0, 0);
+}
 
 static void
 make_peekdata_ops(peekdata_data& dt, const std::string& s)
@@ -328,14 +392,18 @@ make_peekdata_ops(peekdata_data& dt, const std::string& s)
       op = new peekdata_op_binop<std::less<unsigned long>, false>();
     } else if (src == "le") {
       op = new peekdata_op_binop<std::less_equal<unsigned long>, false>();
-    } else if (src == "outd") {
-      op = new peekdata_op_out_decimal();
-    } else if (src == "outh") {
-      op = new peekdata_op_out_hexadecimal();
-    } else if (src == "outs") {
-      op = new peekdata_op_out_string();
-    } else if (src == "outsz") {
-      op = new peekdata_op_out_nulterm_string();
+    } else if (src.substr(0, 4) == "outd") {
+      op = new peekdata_op_out_decimal(read_longval(src, 4));
+    } else if (src.substr(0, 4) == "outh") {
+      op = new peekdata_op_out_hexadecimal(read_longval(src, 4));
+    } else if (src.substr(0, 4) == "outs") {
+      op = new peekdata_op_out_string(read_longval(src, 4));
+    } else if (src.substr(0, 5) == "outsz") {
+      op = new peekdata_op_out_nulterm_string(read_longval(src, 5));
+    } else if (src.substr(0, 5) == "ind") {
+      op = new peekdata_op_in_decimal(read_longval(src, 3));
+    } else if (src.substr(0, 5) == "inh") {
+      op = new peekdata_op_in_hexadecimal(read_longval(src, 3));
     } else if (src.substr(0, 2) == "ld") {
       op = new peekdata_op_peek(strtoul(src.c_str() + 2, 0, 0));
     } else if (src.substr(0, 2) == "cp") {
@@ -374,7 +442,7 @@ void peekdata_init(peekdata_data& dt, const std::string& s)
   dt.popval = 0;
   dt.pid = -1;
   dt.curop = 0;
-  dt.buf.clear();
+  dt.buffer.clear();
   dt.err.clear();
   dt.exec_limit = 256;
   dt.string_limit = 1024;
@@ -400,7 +468,7 @@ void peekdata_exec(peekdata_data& dt, unsigned long sp, int pid)
   dt.popval = 0;
   dt.pid = pid;
   dt.curop = 0;
-  dt.buf.clear();
+  dt.buffer.clear();
   dt.err.clear();
   dt.stk.clear();
   dt.stk.push_back(sp);

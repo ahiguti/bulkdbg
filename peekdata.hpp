@@ -17,7 +17,7 @@ struct peekdata_data {
   unsigned long popval;
   int pid;
   size_t curop;
-  std::string buf;
+  std::vector<std::string> buffer;
   std::string err;
   size_t exec_limit;
   size_t string_limit;
