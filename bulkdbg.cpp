@@ -38,7 +38,7 @@
 #include "syscall_table.hpp"
 #include "peekdata.hpp"
 
-#define DBG(v, x) if (debug_level >= v) { x; }
+#define DBG(v, x) if (cnf.debug_level >= v) { x; }
 
 #if defined(__i386__)
 #define BULKDBG_IP eip
@@ -85,6 +85,7 @@ struct examine_entry {
   peekdata_data *pdata; /* FIXME: leaks */
 };
 
+#if 0
 static int debug_level = 0;
 static int group_bt = 0;
 static int procstat = 0;
@@ -109,6 +110,68 @@ static std::map<std::string, unsigned long> peekdata_syms;
 static std::string calltrace_delim = ":";
 static syscall_info_arr_type syscall_info_arr;
 static syscall_info_arr_type socketcall_info_arr;
+#endif
+
+#if 1
+struct bulkdbg_conf {
+public:
+  int debug_level;
+  int group_bt;
+  int procstat;
+  int same_map;
+  int trace_unw;
+  int trace_fp;
+  int trace_sp;
+  int dump_sp;
+  int dump_regs;
+  int do_strace;
+  int show_offset;
+  int show_offset_hex;
+  int show_calls;
+  int demangle_cxx;
+  int show_threads;
+  int hex_pid;
+  int num_repeat;
+  int repeat_delay;
+  int show_syscall;
+  std::vector<examine_entry> exdata_list;
+  std::map<std::string, unsigned long> peekdata_syms;
+  std::string calltrace_delim;
+  syscall_info_arr_type syscall_info_arr;
+  syscall_info_arr_type socketcall_info_arr;
+public:
+  bulkdbg_conf()
+  {
+    debug_level = 0;
+    group_bt = 0;
+    procstat = 0;
+    same_map = 0;
+    trace_unw = 100;
+    trace_fp = 0;
+    trace_sp = 0;
+    dump_sp = 0;
+    dump_regs = 0;
+    do_strace = 0;
+    show_offset = 0;
+    show_offset_hex = 0;
+    show_calls = 1;
+    demangle_cxx = 0;
+    show_threads = 0;
+    hex_pid = 0;
+    num_repeat = 1;
+    repeat_delay = 0;
+    show_syscall = 0;
+    /* exdata_list; */
+    /* peekdata_syms; */
+    calltrace_delim = ":";
+    /* syscall_info_arr; */
+    /* socketcall_info_arr; */
+  }
+private:
+  bulkdbg_conf(const bulkdbg_conf&);
+  bulkdbg_conf& operator =(const bulkdbg_conf&);
+};
+#endif
 
 struct scoped_bfd {
   scoped_bfd(const char *filename)
@@ -191,8 +254,8 @@ static bool check_shlib(const std::string& fn)
   return vaddr == 0;
 }
 
-static int load_symbol_table(const std::string& fn, symbol_table& st,
-  unsigned long addr_begin)
+static int load_symbol_table(bulkdbg_conf& cnf, const std::string& fn,
+  symbol_table& st, unsigned long addr_begin)
 {
   std::string dbg_fn = "/usr/lib/debug" + fn + ".debug";
   const char *filename = 0;
@@ -245,13 +308,13 @@ static int load_symbol_table(const std::string& fn, symbol_table& st,
     const std::string symstr(sinfo.name);
     DBG(10, fprintf(stderr, "%s %lx f=%x t=%c\n", sinfo.name, (long)sinfo.value,
       (int)sym->flags, sinfo.type));
-    if (!peekdata_syms.empty() &&
-      peekdata_syms.find(symstr) != peekdata_syms.end()) {
+    if (!cnf.peekdata_syms.empty() &&
+      cnf.peekdata_syms.find(symstr) != cnf.peekdata_syms.end()) {
       unsigned long absval = sinfo.value;
       if (st.is_relative) {
 	absval += addr_begin;
       }
-      peekdata_syms[symstr] = absval;
+      cnf.peekdata_syms[symstr] = absval;
       DBG(10, fprintf(stderr, "peekdata sym found %s %lx\n", symstr.c_str(),
 	absval));
     }
@@ -281,13 +344,14 @@ struct symbol_table_map {
       delete i->second;
     }
   }
-  symbol_table *get(const std::string& path, unsigned long addr_begin) {
+  symbol_table *get(bulkdbg_conf& cnf, const std::string& path,
+    unsigned long addr_begin) {
     m_type::iterator i = m.find(path);
     if (i != m.end()) {
       return i->second;
     }
     std::auto_ptr<symbol_table> p(new symbol_table);
-    if (load_symbol_table(path, *p, addr_begin) != 0 ||
+    if (load_symbol_table(cnf, path, *p, addr_begin) != 0 ||
       p->symbols.empty()) {
       p.reset();
     }
@@ -327,7 +391,7 @@ static const symbol_ent *find_symbol(const symbol_table& st,
   return &*j;
 }
 
-static int ptrace_attach_proc(int pid)
+static int ptrace_attach_proc(bulkdbg_conf& cnf, int pid)
 {
   if (ptrace(PTRACE_ATTACH, pid, 0, 0) < 0) {
     DBG(1, perror("ptrace(PTRACE_ATTACH)"));
@@ -342,7 +406,7 @@ static int ptrace_attach_proc(int pid)
   return 0;
 }
 
-static int ptrace_detach_proc(int pid)
+static int ptrace_detach_proc(bulkdbg_conf& cnf, int pid)
 {
   if (ptrace(PTRACE_DETACH, pid, 0, 0) < 0) {
     DBG(1, perror("ptrace(PTRACE_DETACH)"));
@@ -370,7 +434,7 @@ struct proc_info {
   maps_type maps;
 };
 
-static void read_proc_map_ent(char *line, proc_info& pinfo,
+static void read_proc_map_ent(bulkdbg_conf& cnf, char *line, proc_info& pinfo,
   symbol_table_map& stmap)
 {
   char *t1 = strchr(line, ' ');
@@ -402,8 +466,8 @@ static void read_proc_map_ent(char *line, proc_info& pinfo,
   if (e.path == "[vdso]" || e.path == "[vsyscall]") {
     e.is_vdso = true;
   } else {
-    e.stbl = stmap.get(e.path, e.addr_begin);
-    e.relative = e.stbl->is_relative;
+    e.stbl = stmap.get(cnf, e.path, e.addr_begin);
+    e.relative = e.stbl != 0 ? e.stbl->is_relative : false;
   }
   std::string bpath = e.path;
   std::string::size_type sl = bpath.rfind('/');
@@ -414,12 +478,13 @@ static void read_proc_map_ent(char *line, proc_info& pinfo,
     // bpath = "?";
   }
   // fprintf(stderr, "bpath=%s\n", bpath.c_str());
-  e.nosym_symbol.name = bpath;
+  e.nosym_symbol.name = "<" + bpath + ">";
   e.nosym_symbol.addr = e.addr_begin;
   pinfo.maps.push_back(e);
 }
 
-static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
+static void read_maps(bulkdbg_conf& cnf, int pid, proc_info& pi,
+  symbol_table_map& stmap)
 {
   char fn[PATH_MAX];
   char buf[4096];
@@ -429,7 +494,7 @@ static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
     return;
   }
   while (fgets(buf, sizeof(buf), fp) != 0) {
-    read_proc_map_ent(buf, pi, stmap);
+    read_proc_map_ent(cnf, buf, pi, stmap);
   }
   #if 0
   std::sort(pi.maps.begin(), pi.maps.end(), std::less<unsigned long>());
@@ -437,6 +502,7 @@ static void read_maps(int pid, proc_info& pi, symbol_table_map& stmap)
   #endif
 }
 
+#if 0
 static int get_ipreg_procstat(int pid, proc_info& pinfo,
   std::vector<unsigned long>& vals_r)
 {
@@ -470,8 +536,9 @@ static int get_ipreg_procstat(int pid, proc_info& pinfo,
   }
   return vals_r.empty();
 }
+#endif
 
-static int get_user_regs(int pid, user_regs_struct& regs)
+static int get_user_regs(bulkdbg_conf& cnf, int pid, user_regs_struct& regs)
 {
   int count = 100;
   while (1) {
@@ -491,8 +558,8 @@ static int get_user_regs(int pid, user_regs_struct& regs)
   return 0;
 }
 
-static const symbol_ent *pinfo_find_symbol(const proc_info& pinfo,
-  unsigned long addr, unsigned long& offset_r)
+static const symbol_ent *pinfo_find_symbol(bulkdbg_conf& cnf,
+  const proc_info& pinfo, unsigned long addr, unsigned long& offset_r)
 {
   offset_r = 0;
   proc_info::maps_type::const_iterator i = std::upper_bound(
@@ -541,12 +608,13 @@ static const symbol_ent *pinfo_find_symbol(const proc_info& pinfo,
   return 0;
 }
 
-const syscall_info *find_syscall(const user_regs_struct& regs)
+const syscall_info *find_syscall(bulkdbg_conf& cnf,
+  const user_regs_struct& regs)
 {
   const int syscall_num = regs.BULKDBG_ORIG_A;
   const syscall_info *sinfo = 0;
-  if (syscall_num >= 0 && (size_t)syscall_num < syscall_info_arr.size()) {
-    sinfo = &syscall_info_arr[syscall_num];
+  if (syscall_num >= 0 && (size_t)syscall_num < cnf.syscall_info_arr.size()) {
+    sinfo = &cnf.syscall_info_arr[syscall_num];
   }
   #ifdef __i386__
   if (syscall_num == __NR_socketcall) {
@@ -583,15 +651,15 @@ static std::string cxxdemangle(const char *s)
   return std::string(s);
 }
 
-static std::string examine_stack_trace(const proc_info& pinfo,
+static std::string examine_symbols(bulkdbg_conf& cnf, const proc_info& pinfo,
    const user_regs_struct& regs, const std::vector<unsigned long>& vals,
    size_t maxlen, const std::string& edata)
 {
   std::string rstr;
-  if (show_calls == 0) {
+  if (cnf.show_calls == 0) {
     maxlen = 0;
   }
-  if (show_syscall) {
+  if (cnf.show_syscall) {
     const int syscall_num = regs.BULKDBG_ORIG_A;
     if (syscall_num < 0) {
       rstr += "-";
@@ -605,39 +673,53 @@ static std::string examine_stack_trace(const proc_info& pinfo,
   for (size_t i = 0; i < std::min(vals.size(), maxlen); ++i) {
     unsigned long addr = vals[i];
     unsigned long offset = 0;
-    const symbol_ent *e = pinfo_find_symbol(pinfo, addr, offset);
+    const symbol_ent *e = pinfo_find_symbol(cnf, pinfo, addr, offset);
     if (e != 0) {
       const syscall_info *sinfo = 0;
-      #ifdef __i386__
-      if (i == 0 && e->name == "_dl_sysinfo_int80" && offset == 2) { // TODO
-        sinfo = find_syscall(regs);
+      if (i == 0) {
+	#ifdef __i386__
+	if (i == 0 && e->name == "_dl_sysinfo_int80" && offset == 2) { // TODO
+	  sinfo = find_syscall(cnf, regs);
+	}
+	#else
+	sinfo = find_syscall(cnf, regs);
+	#endif
       }
-      #else
-      sinfo = find_syscall(regs);
-      #endif
+#if 0
       if (offset != 0) {
+#endif
 	if (!rstr.empty()) {
-	  rstr += calltrace_delim;
+	  rstr += cnf.calltrace_delim;
 	}
 	if (sinfo != 0) {
 	  rstr += std::string(sinfo->name);
 	} else {
-	  if (demangle_cxx) {
+	  if (cnf.demangle_cxx) {
 	    rstr += cxxdemangle(e->name.c_str());
 	  } else {
 	    rstr += e->name;
 	  }
 	}
-	if (show_offset) {
+	if (cnf.show_offset) {
 	  char buf[32];
-	  if (show_offset_hex) {
-	    snprintf(buf, 32, "(%lx+%.*lx)", addr-offset, show_offset, offset);
+	  if (cnf.show_offset_hex) {
+	    snprintf(buf, 32, "(%lx+%.*lx)", addr-offset, cnf.show_offset,
+	      offset);
 	  } else {
-	    snprintf(buf, 32, "(%lx+%.*ld)", addr-offset, show_offset, offset);
+	    snprintf(buf, 32, "(%lx+%.*ld)", addr-offset, cnf.show_offset,
+	      offset);
 	  }
 	  rstr += std::string(buf);
 	}
+#if 0
+      } else {
+	if (!rstr.empty()) {
+	  rstr += calltrace_delim;
+	}
+	rstr += "offset0"; // FIXME
       }
+#endif
+#if 0
     } else if (offset != 0) {
       /* vdso */
       if (i == 0 && offset == 0x410) { // TODO
@@ -649,11 +731,12 @@ static std::string examine_stack_trace(const proc_info& pinfo,
 	  rstr += "(" + std::string(sinfo->name) + ")";
 	}
       }
+#endif
     } else {
       char buf[32];
       snprintf(buf, 32, "(%lx)", addr);
       if (!rstr.empty()) {
-	rstr += calltrace_delim;
+	rstr += cnf.calltrace_delim;
       }
       rstr += std::string(buf);
     }
@@ -667,15 +750,16 @@ static std::string examine_stack_trace(const proc_info& pinfo,
   return rstr;
 }
 
-static void dump_stack(int pid, const proc_info& pinfo, unsigned long sp,
-  const std::vector<unsigned long>& vals, size_t maxlen)
+#if 0
+static void dump_stack(bulkdbg_conf& cnf, int pid, const proc_info& pinfo,
+  unsigned long sp, const std::vector<unsigned long>& vals, size_t maxlen)
 {
   for (size_t i = 1; i < std::min(vals.size(), maxlen + 1);
     ++i, sp += sizeof(long)) {
     unsigned long val = vals[i];
     std::string sym;
     unsigned long offset = 0;
-    const symbol_ent *e = pinfo_find_symbol(pinfo, val, offset);
+    const symbol_ent *e = pinfo_find_symbol(cnf, pinfo, val, offset);
     if (e != 0) {
       if (sizeof(val) == 4) {
         printf("%d - %08lx %08lx %s+%lx\n",
@@ -693,6 +777,7 @@ static void dump_stack(int pid, const proc_info& pinfo, unsigned long sp,
     }
   }
 }
+#endif
 
 static std::string get_user_regs_str(int pid, const user_regs_struct& regs)
 {
@@ -748,17 +833,18 @@ static std::string get_user_regs_str(int pid, const user_regs_struct& regs)
   return s;
 }
 
-static void dump_user_regs(int pid, const user_regs_struct& regs)
+static void dump_user_regs(bulkdbg_conf& cnf, int pid,
+  const user_regs_struct& regs)
 {
   std::string s = get_user_regs_str(pid, regs);
-  if (hex_pid) {
+  if (cnf.hex_pid) {
     printf("%x\t%s\n", pid, s.c_str());
   } else {
     printf("%d\t%s\n", pid, s.c_str());
   }
 }
 
-static int get_stack_trace_unw(unw_addr_space_t unw_as,
+static int get_stack_trace_unw(bulkdbg_conf& cnf, unw_addr_space_t unw_as,
   struct UPT_info *saved_ui, int pid, proc_info& pinfo, unsigned int maxlen,
   const user_regs_struct& regs, std::vector<unsigned long>& vals_r,
   std::string& edata_r)
@@ -786,7 +872,7 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 	break;
       }
       unsigned long offset = 0;
-      const symbol_ent *e = pinfo_find_symbol(pinfo, ip, offset);
+      const symbol_ent *e = pinfo_find_symbol(cnf, pinfo, ip, offset);
       ip_prev = ip;
       vals_r.push_back(ip);
       if (unw_get_reg(&cur, UNW_REG_SP, &sp) < 0) {
@@ -797,16 +883,16 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
 	/* module not found. dont trace futher. */
 	break;
       }
-      if (!exdata_list.empty()) {
+      if (!cnf.exdata_list.empty()) {
 	if (e != 0) {
-	  for (size_t i = 0; i < exdata_list.size(); ++i) {
-	    examine_entry& ee = exdata_list[i];
+	  for (size_t i = 0; i < cnf.exdata_list.size(); ++i) {
+	    examine_entry& ee = cnf.exdata_list[i];
 	    if (ee.funcname == e->name &&
 	      (ee.offset == 0 || ee.offset == offset) &&
 	      (ee.upfuncname.empty() || ee.upfuncname == upfn)) {
 	      for (std::map<std::string, unsigned long>::iterator i
 		= ee.pdata->syms.begin(); i != ee.pdata->syms.end(); ++i) {
-		i->second = peekdata_syms[i->first];
+		i->second = cnf.peekdata_syms[i->first];
 	      }
 	      peekdata_exec(*ee.pdata, sp, pid);
 	      if (!ee.pdata->err.empty()) {
@@ -857,8 +943,10 @@ static int get_stack_trace_unw(unw_addr_space_t unw_as,
   return 0;
 }
 
-static int get_stack_trace(int pid, proc_info& pinfo, unsigned int maxlen,
-  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
+#if 0
+static int get_stack_trace(bulkdbg_conf& cnf, int pid, proc_info& pinfo,
+  unsigned int maxlen, const user_regs_struct& regs,
+  std::vector<unsigned long>& vals_r)
 {
   unsigned long ip = regs.BULKDBG_IP;
   unsigned long fp = regs.BULKDBG_FP;
@@ -887,8 +975,9 @@ static int get_stack_trace(int pid, proc_info& pinfo, unsigned int maxlen,
   return 0;
 }
 
-static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
-  const user_regs_struct& regs, std::vector<unsigned long>& vals_r)
+static int get_stack_trace_sp(bulkdbg_conf& cnf, int pid, proc_info& pinfo,
+  unsigned int maxlen, const user_regs_struct& regs,
+  std::vector<unsigned long>& vals_r)
 {
   unsigned long sp = regs.BULKDBG_SP;
   unsigned long ip = regs.BULKDBG_IP;
@@ -908,113 +997,139 @@ static int get_stack_trace_sp(int pid, proc_info& pinfo, unsigned int maxlen,
   }
   return 0;
 }
+#endif
 
-static int bulkdbg_pids(const std::vector<int>& pids)
-{
-  unsigned int trace_length = 0;
-  unsigned int unwlength = 0;
-  unsigned int fplength = 0;
-  unsigned int splength = 0;
-  if (trace_unw) {
-    unwlength = trace_unw;
-    trace_length = trace_unw;
-  } else if (trace_fp) {
-    fplength = trace_fp;
-    splength = dump_sp;
-    trace_length = trace_fp;
-  } else {
-    fplength = 0;
-    splength = std::max(trace_sp, dump_sp);
-    trace_length = trace_sp;
-  }
-  unw_addr_space_t unw_as = 0;
-  if (trace_unw != 0) {
-    unw_as = unw_create_addr_space(&_UPT_accessors, 0);
-    if (!unw_as) {
-      return -1;
-    }
-    if (same_map) {
-      unw_set_caching_policy(unw_as, UNW_CACHE_GLOBAL);
-    }
-  }
-  int pid = -1;
+struct bulkdbg {
+  bulkdbg();
+  ~bulkdbg();
+  bulkdbg_conf cnf;
+  unw_addr_space_t unw_as;
   proc_info pinfo;
   symbol_table_map stmap;
+};
+
+bulkdbg::bulkdbg()
+  : unw_as(0)
+{
+}
+
+bulkdbg::~bulkdbg()
+{
+  if (unw_as != 0) {
+    unw_destroy_addr_space(unw_as);
+  }
+}
+
+static bool
+bulkdbg_prepare_for_backtrace(bulkdbg& bpt)
+{
+  if (bpt.unw_as != 0) {
+    return false;
+  }
+  bpt.unw_as = unw_create_addr_space(&_UPT_accessors, 0);
+  if (!bpt.unw_as) {
+    return false;
+  }
+  if (bpt.cnf.same_map) {
+    unw_set_caching_policy(bpt.unw_as, UNW_CACHE_GLOBAL);
+  }
+  return true;
+}
+
+static void
+bulkdbg_prepare_maps(bulkdbg& bpt, pid_t pid)
+{
+  if (!bpt.cnf.same_map || bpt.stmap.empty()) {
+    bpt.pinfo = proc_info();
+    read_maps(bpt.cnf, pid, bpt.pinfo, bpt.stmap);
+  }
+}
+
+static bool bulkdbg_backtrace_internal(bulkdbg& bpt, bool attach_flag,
+  pid_t pid, std::string& data_r)
+{
+  bulkdbg_conf& cnf = bpt.cnf;
+  bulkdbg_prepare_for_backtrace(bpt);
+  bulkdbg_prepare_maps(bpt, pid);
+  std::vector<unsigned long> vals;
+  std::string edata;
+  user_regs_struct regs = { 0 };
+  if (attach_flag && ptrace_attach_proc(bpt.cnf, pid) != 0) {
+    return false;
+  }
+  bool r = false;
+  do {
+    if (get_user_regs(bpt.cnf, pid, regs) != 0) {
+      break;
+    }
+    std::string edata; /* examine data */
+    if (get_stack_trace_unw(cnf, bpt.unw_as, 0, pid, bpt.pinfo, 100, regs,
+      vals, edata) != 0) {
+      break;
+    }
+    std::string s;
+    s = examine_symbols(cnf, bpt.pinfo, regs, vals, vals.size(), edata);
+    if (cnf.dump_regs) {
+      s = get_user_regs_str(pid, regs) + "\t" + s;
+    }
+    data_r = s;
+    r = true;
+  } while (0);
+  if (attach_flag) {
+    ptrace_detach_proc(bpt.cnf, pid);
+  }
+  return r;
+}
+
+static bool bulkdbg_examine_symbol_internal(bulkdbg& bpt, pid_t pid,
+  unsigned long addr, std::string& sym_r, unsigned long& offset_r)
+{
+  bulkdbg_prepare_maps(bpt, pid);
+  const symbol_ent *e = pinfo_find_symbol(bpt.cnf, bpt.pinfo, addr, offset_r);
+  if (e != 0) {
+    if (bpt.cnf.demangle_cxx) {
+      sym_r = cxxdemangle(e->name.c_str());
+    } else {
+      sym_r = e->name;
+    }
+    return true;
+  }
+  return false;
+}
+
+static void bulkdbg_pids(bulkdbg& bpt, const std::vector<int>& pids)
+{
   typedef std::map<std::string, unsigned> cntmap_type;
   cntmap_type cntmap;
-  for (int cnt = 0; cnt < num_repeat; ++cnt) {
+  bulkdbg_conf& cnf = bpt.cnf;
+  for (int cnt = 0; cnt < cnf.num_repeat; ++cnt) {
     for (size_t i = 0; i < pids.size(); ++i) {
-      pid = pids[i];
-      std::vector<unsigned long> vals_fp, vals_sp;
-      std::string edata;
-      user_regs_struct regs = { 0 };
-      if (!same_map || stmap.empty()) {
-	pinfo = proc_info();
-	read_maps(pid, pinfo, stmap);
-      }
-      bool failed = false;
-      if (procstat) {
-	if (get_ipreg_procstat(pid, pinfo, vals_fp) != 0) {
-	  failed = true;
-	}
-      } else {
-	if (ptrace_attach_proc(pid) != 0) {
-	  failed = true;
-	} else {
-	  if (get_user_regs(pid, regs) != 0) {
-	    failed = true;
-	  } else {
-	    if (unwlength &&
-	      get_stack_trace_unw(unw_as, 0, pid, pinfo, 100, regs, vals_fp,
-		edata) != 0) {
-	      failed = true;
-	    }
-	    if (fplength &&
-	      get_stack_trace(pid, pinfo, fplength, regs, vals_fp) != 0) {
-	      failed = true;
-	    }
-	    if (splength &&
-	      get_stack_trace_sp(pid, pinfo, splength, regs, vals_sp) != 0) {
-	      failed = true;
-	    }
-	  }
-	}
-	ptrace_detach_proc(pid);
-      }
+      pid_t pid = pids[i];
       std::string tr;
-      if (!failed) {
-	if (procstat || trace_unw || trace_fp) {
-	  tr = examine_stack_trace(pinfo, regs, vals_fp, trace_length, edata);
-	} else {
-	  tr = examine_stack_trace(pinfo, regs, vals_sp, trace_length, edata);
-	}
-      } else {
+      if (!bulkdbg_backtrace_internal(bpt, true, pid, tr)) {
 	tr = "[unknown]";
       }
       if (tr.empty()) {
 	tr = "[nodata]";
       }
-      if (group_bt == 0) {
-	if (dump_regs) {
-	  tr = get_user_regs_str(pid, regs) + "\t" + tr;
-	}
-	if (trace_sp != 0 || trace_fp != 0 || trace_unw != 0) {
-	  if (hex_pid) {
-	    printf("%x\t%s\n", pid, tr.c_str());
-	  } else {
-	    printf("%d\t%s\n", pid, tr.c_str());
-	  }
+      if (cnf.group_bt == 0) {
+	if (cnf.hex_pid) {
+	  printf("%x\t%s\n", pid, tr.c_str());
+	} else {
+	  printf("%d\t%s\n", pid, tr.c_str());
 	}
       } else {
 	cntmap[tr] += 1;
       }
-      if (dump_sp) {
-	dump_stack(pid, pinfo, regs.BULKDBG_SP, vals_sp, dump_sp);
+      #if 0
+      if (cnf.dump_sp) {
+	dump_stack(cnf, pid, pinfo, regs.BULKDBG_SP, vals_sp, cnf.dump_sp);
       }
+      #endif
     }
-    if (cnt + 1 < num_repeat && repeat_delay != 0) {
+    if (cnt + 1 < cnf.num_repeat && cnf.repeat_delay != 0) {
       /* delay */
-      int denom = RAND_MAX / repeat_delay;
+      int denom = RAND_MAX / cnf.repeat_delay;
       int rv = (rand() / denom) * 2;
       struct timespec ts = { 0 };
       #if 0
@@ -1025,19 +1140,146 @@ static int bulkdbg_pids(const std::vector<int>& pids)
       nanosleep(&ts, 0);
     }
   }
-  if (group_bt != 0) {
+  if (cnf.group_bt != 0) {
     for (cntmap_type::const_iterator i = cntmap.begin(); i != cntmap.end();
       ++i) {
       printf("%u\t%s\n", i->second, i->first.c_str());
     }
   }
-  if (trace_unw != 0) {
+}
+
+#if 0
+static int bulkdbg_pids___(bulkdbg_conf& cnf, const std::vector<int>& pids)
+{
+  unsigned int trace_length = 0;
+  unsigned int unwlength = 0;
+  unsigned int fplength = 0;
+  unsigned int splength = 0;
+  if (cnf.trace_unw) {
+    unwlength = cnf.trace_unw;
+    trace_length = cnf.trace_unw;
+  } else if (cnf.trace_fp) {
+    fplength = cnf.trace_fp;
+    splength = cnf.dump_sp;
+    trace_length = cnf.trace_fp;
+  } else {
+    fplength = 0;
+    splength = std::max(cnf.trace_sp, cnf.dump_sp);
+    trace_length = cnf.trace_sp;
+  }
+  unw_addr_space_t unw_as = 0;
+  if (cnf.trace_unw != 0) {
+    unw_as = unw_create_addr_space(&_UPT_accessors, 0);
+    if (!unw_as) {
+      return -1;
+    }
+    if (cnf.same_map) {
+      unw_set_caching_policy(unw_as, UNW_CACHE_GLOBAL);
+    }
+  }
+  int pid = -1;
+  proc_info pinfo;
+  symbol_table_map stmap;
+  typedef std::map<std::string, unsigned> cntmap_type;
+  cntmap_type cntmap;
+  for (int cnt = 0; cnt < cnf.num_repeat; ++cnt) {
+    for (size_t i = 0; i < pids.size(); ++i) {
+      pid = pids[i];
+      std::vector<unsigned long> vals_fp, vals_sp;
+      std::string edata;
+      user_regs_struct regs = { 0 };
+      if (!cnf.same_map || stmap.empty()) {
+	pinfo = proc_info();
+	read_maps(cnf, pid, pinfo, stmap);
+      }
+      bool failed = false;
+      if (cnf.procstat) {
+	if (get_ipreg_procstat(pid, pinfo, vals_fp) != 0) {
+	  failed = true;
+	}
+      } else {
+	if (ptrace_attach_proc(cnf, pid) != 0) {
+	  failed = true;
+	} else {
+	  if (get_user_regs(cnf, pid, regs) != 0) {
+	    failed = true;
+	  } else {
+	    if (unwlength &&
+	      get_stack_trace_unw(cnf, unw_as, 0, pid, pinfo, 100, regs,
+		vals_fp, edata) != 0) {
+	      failed = true;
+	    }
+	    if (fplength &&
+	      get_stack_trace(cnf, pid, pinfo, fplength, regs, vals_fp) != 0) {
+	      failed = true;
+	    }
+	    if (splength &&
+	      get_stack_trace_sp(cnf, pid, pinfo, splength, regs, vals_sp)
+		!= 0) {
+	      failed = true;
+	    }
+	  }
+	}
+	ptrace_detach_proc(cnf, pid);
+      }
+      std::string tr;
+      if (!failed) {
+	if (cnf.procstat || cnf.trace_unw || cnf.trace_fp) {
+	  tr = examine_symbols(cnf, pinfo, regs, vals_fp, trace_length, edata);
+	} else {
+	  tr = examine_symbols(cnf, pinfo, regs, vals_sp, trace_length, edata);
+	}
+      } else {
+	tr = "[unknown]";
+      }
+      if (tr.empty()) {
+	tr = "[nodata]";
+      }
+      if (cnf.group_bt == 0) {
+	if (cnf.dump_regs) {
+	  tr = get_user_regs_str(pid, regs) + "\t" + tr;
+	}
+	if (cnf.trace_sp != 0 || cnf.trace_fp != 0 || cnf.trace_unw != 0) {
+	  if (cnf.hex_pid) {
+	    printf("%x\t%s\n", pid, tr.c_str());
+	  } else {
+	    printf("%d\t%s\n", pid, tr.c_str());
+	  }
+	}
+      } else {
+	cntmap[tr] += 1;
+      }
+      if (cnf.dump_sp) {
+	dump_stack(cnf, pid, pinfo, regs.BULKDBG_SP, vals_sp, cnf.dump_sp);
+      }
+    }
+    if (cnt + 1 < cnf.num_repeat && cnf.repeat_delay != 0) {
+      /* delay */
+      int denom = RAND_MAX / cnf.repeat_delay;
+      int rv = (rand() / denom) * 2;
+      struct timespec ts = { 0 };
+      #if 0
+      fprintf(stderr, "%d\n", rv);
+      #endif
+      ts.tv_sec = rv / 1000000;
+      ts.tv_nsec = (rv % 1000000) * 1000;
+      nanosleep(&ts, 0);
+    }
+  }
+  if (cnf.group_bt != 0) {
+    for (cntmap_type::const_iterator i = cntmap.begin(); i != cntmap.end();
+      ++i) {
+      printf("%u\t%s\n", i->second, i->first.c_str());
+    }
+  }
+  if (cnf.trace_unw != 0) {
     unw_destroy_addr_space(unw_as);
   }
   return 0;
 }
+#endif
 
-static void load_syscall_info()
+static void load_syscall_info(bulkdbg_conf& cnf)
 {
   #if defined(__i386__)
   const syscall_table_type *p = syscall_table_32;
@@ -1046,10 +1288,10 @@ static void load_syscall_info()
   #endif
   for (; p->id >= 0; ++p) {
     size_t id = p->id;
-    if (syscall_info_arr.size() <= id) {
-      syscall_info_arr.resize(id + 1);
+    if (cnf.syscall_info_arr.size() <= id) {
+      cnf.syscall_info_arr.resize(id + 1);
     }
-    syscall_info& e = syscall_info_arr[id];
+    syscall_info& e = cnf.syscall_info_arr[id];
     e.name = p->name;
   }
   #ifdef __i386__
@@ -1086,12 +1328,12 @@ static void load_syscall_info()
   #endif
 }
 
-static int strace_proc(int pid)
+static int strace_proc(bulkdbg_conf& cnf, int pid)
 {
   setvbuf(stdout, 0, _IONBF, 0);
   unw_addr_space_t unw_as = 0;
   struct UPT_info *saved_ui = 0;
-  if (trace_unw != 0) {
+  if (cnf.trace_unw != 0) {
     unw_as = unw_create_addr_space(&_UPT_accessors, 0);
     if (!unw_as) {
       return -1;
@@ -1101,7 +1343,7 @@ static int strace_proc(int pid)
   }
   DBG(100, fprintf(stderr, "strace %d\n", pid));
   int err = 0;
-  if (ptrace_attach_proc(pid) != 0) {
+  if (ptrace_attach_proc(cnf, pid) != 0) {
     return -1;
   }
   #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,22))
@@ -1117,7 +1359,7 @@ static int strace_proc(int pid)
   proc_info pinfo;
   symbol_table_map stmap;
   pinfo = proc_info();
-  read_maps(pid, pinfo, stmap);
+  read_maps(cnf, pid, pinfo, stmap);
   for (int i = 0; ; ++i, syscall_enter = !syscall_enter) {
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
       DBG(1, perror("ptrace(PTRACE_SYSCALL)"));
@@ -1132,11 +1374,11 @@ static int strace_proc(int pid)
       break;
     }
     user_regs_struct regs = { 0 };
-    if (get_user_regs(pid, regs) != 0) {
+    if (get_user_regs(cnf, pid, regs) != 0) {
       err = -1;
       break;
     }
-    const syscall_info *const sinfo = find_syscall(regs);
+    const syscall_info *const sinfo = find_syscall(cnf, regs);
     const char *const syscall_name = sinfo ? sinfo->name : "unknown";
     if (syscall_enter == 0 && sinfo != sinfo_prev) {
       /* possible? */
@@ -1147,16 +1389,16 @@ static int strace_proc(int pid)
     }
     /* i386: ebx, ecx, edx, esi, edi */
     std::string tr;
-    if (trace_unw && syscall_enter != 0) {
+    if (cnf.trace_unw && syscall_enter != 0) {
       vals_fp.clear();
       edata.clear();
-      if (get_stack_trace_unw(unw_as, saved_ui, pid, pinfo, 100, regs, vals_fp,
-	edata) != 0) {
+      if (get_stack_trace_unw(cnf, unw_as, saved_ui, pid, pinfo, 100, regs,
+	vals_fp, edata) != 0) {
 	DBG(1, fprintf(stderr, "failed to get trace unw\n"));
 	err = -1;
 	break;
       } else {
-        tr = examine_stack_trace(pinfo, regs, vals_fp, trace_unw, edata);
+        tr = examine_symbols(cnf, pinfo, regs, vals_fp, cnf.trace_unw, edata);
       }
     }
     if (syscall_enter) {
@@ -1174,17 +1416,17 @@ static int strace_proc(int pid)
       long scret = regs.BULKDBG_A;
       printf(" = %ld\n", scret);
     }
-    if (dump_regs) {
-      dump_user_regs(pid, regs);
+    if (cnf.dump_regs) {
+      dump_user_regs(cnf, pid, regs);
     }
     sinfo_prev = sinfo;
-    if (do_strace > 0) {
-      if (i >= do_strace) {
+    if (cnf.do_strace > 0) {
+      if (i >= cnf.do_strace) {
         break;
       }
     }
   }
-  ptrace_detach_proc(pid);
+  ptrace_detach_proc(cnf, pid);
   if (saved_ui != 0) {
     _UPT_destroy(saved_ui);
   }
@@ -1215,7 +1457,8 @@ static void get_thread_ids(int pid, std::vector<int>& pids_r)
   pids_r.insert(pids_r.end(), pids.begin(), pids.end());
 }
 
-static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
+static int parse_options(bulkdbg_conf& cnf, int argc, char **argv,
+  std::vector<int>& pids_r)
 {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -1225,29 +1468,29 @@ static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
       const std::string v = arg.substr(eq + 1);
       const int vint = atoi(v.c_str());
       if (k == "debug") {
-        debug_level = vint;
+        cnf.debug_level = vint;
       } else if (k == "group") {
-        group_bt = vint;
+        cnf.group_bt = vint;
       } else if (k == "unwtrace") {
-        trace_unw = vint;
-        trace_fp = 0;
-        trace_sp = 0;
+        cnf.trace_unw = vint;
+        cnf.trace_fp = 0;
+        cnf.trace_sp = 0;
       } else if (k == "fptrace") {
-        trace_fp = vint;
-        trace_unw = 0;
-        trace_sp = 0;
+        cnf.trace_fp = vint;
+        cnf.trace_unw = 0;
+        cnf.trace_sp = 0;
 	#if defined(__x86_64__)
-        trace_unw = vint;
-        trace_fp = 0;
+        cnf.trace_unw = vint;
+        cnf.trace_fp = 0;
 	#endif
       } else if (k == "procstat") {
-	procstat = vint;
+	cnf.procstat = vint;
       } else if (k == "sptrace") {
-        trace_sp = vint;
-        trace_fp = 0;
-        trace_unw = 0;
+        cnf.trace_sp = vint;
+        cnf.trace_fp = 0;
+        cnf.trace_unw = 0;
       } else if (k == "showcalls") {
-	show_calls = vint;
+	cnf.show_calls = vint;
       } else if (k == "examine") {
 	const std::string s = v;
 	std::string::size_type i = s.find(':');
@@ -1269,8 +1512,8 @@ static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
 	  offset = strtoull(fn.c_str() + i + 1, 0, 0);
 	  fn = fn.substr(0, i);
 	}
-	exdata_list.push_back(examine_entry());
-	examine_entry& ee = exdata_list.back();
+	cnf.exdata_list.push_back(examine_entry());
+	examine_entry& ee = cnf.exdata_list.back();
 	ee.upfuncname = upfn;
 	ee.funcname = fn;
 	ee.offset = offset;
@@ -1283,44 +1526,42 @@ static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
 	for (std::map<std::string, unsigned long>::const_iterator i
 	  = ee.pdata->syms.begin(); i != ee.pdata->syms.end(); ++i) {
 	  DBG(10, fprintf(stderr, "Peekdata: sym %s\n", i->first.c_str()));
-	  peekdata_syms[i->first];
+	  cnf.peekdata_syms[i->first];
 	}
       } else if (k == "spdump") {
-        dump_sp = vint;
+        cnf.dump_sp = vint;
       } else if (k == "regs") {
-        dump_regs= vint;
+        cnf.dump_regs= vint;
       } else if (k == "strace") {
-        do_strace = vint;
+        cnf.do_strace = vint;
       } else if (k == "offset") {
-        show_offset = vint;
+        cnf.show_offset = vint;
 	if (v.size() > 0 && v[v.size() - 1] == 'x') {
-	  show_offset_hex = 1;
+	  cnf.show_offset_hex = 1;
 	}
-      #if 0
       } else if (k == "samemap") {
-	same_map = vint;
-      #endif
+	cnf.same_map = vint;
       } else if (k == "allthreads") {
-	show_threads = vint;
+	cnf.show_threads = vint;
       } else if (k == "demangle") {
-	demangle_cxx = vint;
+	cnf.demangle_cxx = vint;
 	if (vint) {
-	  calltrace_delim = ";";
+	  cnf.calltrace_delim = ";";
 	}
       } else if (k == "hexpid") {
-	hex_pid = vint;
+	cnf.hex_pid = vint;
       } else if (k == "showsys") {
-	show_syscall = vint;
+	cnf.show_syscall = vint;
       } else if (k == "repeat") {
-	num_repeat = vint;
+	cnf.num_repeat = vint;
       } else if (k == "delay") {
-	repeat_delay = vint;
+	cnf.repeat_delay = vint;
       }
     } else {
       pids_r.push_back(atoi(argv[i]));
     }
   }
-  if (show_threads) {
+  if (cnf.show_threads) {
     if (pids_r.size() > 1) {
       fprintf(stderr, "Can not debug multiple processes when allthreads=1\n");
       return 2;
@@ -1329,12 +1570,12 @@ static int parse_options(int argc, char **argv, std::vector<int>& pids_r)
       pids_r.clear();
       get_thread_ids(pid, pids_r);
     }
-    same_map = 1;
+    cnf.same_map = 1;
   }
   return 0;
 }
 
-static int usage(const char *argv0)
+static int bulkdbg_usage(const char *argv0)
 {
   fprintf(stderr,
     "Usage: \n"
@@ -1366,24 +1607,91 @@ static int usage(const char *argv0)
   return 1;
 }
 
-int main(int argc, char **argv)
+extern "C" {
+
+int bulkdbg_main(int argc, char **argv)
 {
+  srand(time(0));
   if (argc < 2) {
-    return usage(argv[0]);
+    return bulkdbg_usage(argv[0]);
   }
   std::vector<int> pids;
-  if (parse_options(argc, argv, pids) != 0) {
+  bulkdbg bpt;
+  if (parse_options(bpt.cnf, argc, argv, pids) != 0) {
     return 2;
   }
   if (pids.size() == 0) {
-    return usage(argv[0]);
+    return bulkdbg_usage(argv[0]);
   }
-  load_syscall_info();
-  srand(time(0));
-  if (do_strace != 0) {
-    return strace_proc(pids[0]);
+  load_syscall_info(bpt.cnf);
+  if (bpt.cnf.do_strace != 0) {
+    return strace_proc(bpt.cnf, pids[0]);
   } else {
-    return bulkdbg_pids(pids);
+    bulkdbg_pids(bpt, pids);
+    return 0;
   }
 }
+
+bulkdbg *bulkdbg_new(const char *confstr)
+{
+  std::auto_ptr<bulkdbg> bpt(new bulkdbg());
+  std::vector<std::string> args;
+  if (confstr != 0) {
+    std::string s(confstr);
+    s += " ";
+    size_t p = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == ' ') {
+	if (i != p) {
+	  args.push_back(s.substr(p, i - p) + "\0");
+	}
+	p = i + 1;
+      }
+    }
+  }
+  std::vector<char *> argv;
+  argv.push_back(0);
+  for (size_t i = 0; i < args.size(); ++i) {
+    std::string& s = args[i];
+    argv.push_back(&s[0]);
+  }
+  std::vector<int> pids;
+  if (parse_options(bpt->cnf, argv.size(), &argv[0], pids) != 0) {
+    return 0;
+  }
+  return bpt.release();
+}
+
+void bulkdbg_destroy(bulkdbg *bpt)
+{
+  delete bpt;
+}
+
+char *bulkdbg_backtrace(bulkdbg *bpt, int attach_flag, pid_t pid)
+{
+  std::string s;
+  bool r = bulkdbg_backtrace_internal(*bpt, attach_flag, pid, s);
+  if (!r) {
+    return 0;
+  }
+  return strdup(s.c_str());
+}
+
+char *bulkdbg_examine_symbol(bulkdbg *bpt, pid_t pid, unsigned long addr,
+  unsigned long *offset_r)
+{
+  std::string s;
+  unsigned long o = 0;
+  bool r = bulkdbg_examine_symbol_internal(*bpt, pid, addr, s, o);
+  if (!r) {
+    return 0;
+  }
+  if (offset_r != 0) {
+    *offset_r = o;
+  }
+  return strdup(s.c_str());
+}
+
+};
+
 

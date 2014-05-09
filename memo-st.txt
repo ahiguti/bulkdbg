@@ -1,0 +1,21 @@
+
+- bulkdbg_pids()関数の機能を外部から呼び出す形で使えるようにする
+  ptraceでアタッチしてcall chainを取る部分
+  - bulkdbg_ptrace_new();
+  - bulkdbg_ptrace_destroy(pctx);
+  - bulkdbg_ptrace_attach(pctx, pid);
+  - bulkdbg_ptrace_callchain(pctx, pid, vals);
+  - bulkdbg_ptrace_detach(pctx, pid);
+
+  アドレスをシンボルに変換する部分(phsのコードを元に)
+  - bulkdbg_symbols_new(const char *pid /* pid or "self" */);
+  - bulkdbg_symbols_destroy(sctx);
+  - bulkdbg_symbols_resolve(sctx, pid, ulong addr, ulong& offset_r);
+
+  ptrace_callchainも内部でシンボル変換をする必要がある(backtrace打
+  ち切りの判断とexamine_data処理)ので、pctxはsctxを保持する。
+
+TODO:
+- pidごとにmapsを保存
+- mapsをリロードする関数を用意
+

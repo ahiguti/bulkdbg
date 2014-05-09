@@ -1,6 +1,6 @@
 Summary: bulkdbg
 Name: bulkdbg
-Version: 0.0.20
+Version: 0.0.22
 Release: 1%{?dist}
 Group: System Environment/Libraries
 License: BSD
@@ -21,9 +21,15 @@ make
 %install
 rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT/%{_bindir}
+mkdir -p $RPM_BUILD_ROOT/%{_includedir}
+mkdir -p $RPM_BUILD_ROOT/%{_libdir}
 install -m 755 bulkdbg $RPM_BUILD_ROOT/%{_bindir}
+install -m 644 bulkdbg.h $RPM_BUILD_ROOT/%{_includedir}
+install -m 644 libbulkdbg.a $RPM_BUILD_ROOT/%{_libdir}
 
 %files
 %defattr(-, root, root)
+%{_includedir}/*
 %{_bindir}/*
+%{_libdir}/*
 
