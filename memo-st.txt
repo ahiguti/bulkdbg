@@ -1,4 +1,9 @@
 
+FIXME:
+- peekdata_symsを再び動くように
+- same_map廃止、tidからpidを引く
+
+
 - bulkdbg_pids()関数の機能を外部から呼び出す形で使えるようにする
   ptraceでアタッチしてcall chainを取る部分
   - bulkdbg_ptrace_new();
@@ -18,4 +23,15 @@
 TODO:
 - pidごとにmapsを保存
 - mapsをリロードする関数を用意
+- gettimeofdayにいるときにトレースが取れていない。たぶんvdsoだから。
+- symbol_tableはマップされたアドレスとは無関係にしておき、必要なら
+  findするときにオフセットをずらす。
+
+--------------------------------
+is_relativeがtrueのときは、シンボルの値はマップされた位置からの
+相対アドレスである。
+
+1. symbol_table_prc::getをaddr_beginを渡さなくていいようにする
+  そのためにpeekdataのための(関数以外の)シンボルも保持するようにする
+
 
