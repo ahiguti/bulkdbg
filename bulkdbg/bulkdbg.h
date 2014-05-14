@@ -17,6 +17,7 @@ char *bulkdbg_backtrace(struct bulkdbg *bpt, int attach_ptrace_flag,
   pid_t pid);
 char *bulkdbg_examine_symbol(struct bulkdbg *bpt, pid_t pid,
   unsigned long addr, unsigned long *offset_r);
+void bulkdbg_flush_maps(struct bulkdbg *bpt, pid_t pid);
 
 #ifdef __cplusplus
 };

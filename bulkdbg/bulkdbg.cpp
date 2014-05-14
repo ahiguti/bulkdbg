@@ -163,8 +163,10 @@ struct symbol_table_mod {
   std::map<std::string, unsigned long> exdata_syms; /* used by exdata. */
   unsigned long text_vma;
   unsigned long text_size;
+  unsigned long load_vaddr;
   bool is_relative;
-  symbol_table_mod() : text_vma(0), text_size(0), is_relative(false) { }
+  symbol_table_mod() : text_vma(0), text_size(0), load_vaddr(0),
+    is_relative(false) { }
 };
 
 struct proc_map_ent {
@@ -223,6 +225,7 @@ struct bulkdbg {
   bulkdbg_conf cnf;
   pid_t get_tgid(pid_t tid);
   per_process& get_proc(pid_t pid);
+  void erase_proc(pid_t pid);
   symbol_table_mod *get_mod(const std::string& modname);
 private:
   pmap_type pmap;
@@ -244,9 +247,18 @@ bulkdbg::~bulkdbg()
   }
 }
 
+void bulkdbg::erase_proc(pid_t pid)
+{
+  pid_t k = pid;
+  pmap_type::iterator i = pmap.find(k);
+  if (i != pmap.end()) {
+    delete i->second;
+    pmap.erase(k);
+  }
+}
+
 per_process& bulkdbg::get_proc(pid_t pid)
 {
-  // pid_t k = cnf.same_map ? 0 : pid;
   pid_t k = pid;
   pmap_type::iterator i = pmap.find(k);
   if (i != pmap.end()) {
@@ -309,7 +321,8 @@ private:
   auto_fp& operator =(const auto_fp&);
 };
 
-static bool check_shlib(const std::string& fn)
+// static unsigned long check_shlib(const std::string& fn)
+static bool check_shlib(const std::string& fn, unsigned long& vaddr_r)
 {
   auto_fp fp(fopen(fn.c_str(), "r"));
   if (fp == 0) {
@@ -341,25 +354,35 @@ static bool check_shlib(const std::string& fn)
     #endif
     if (p->p_type == PT_LOAD && (p->p_flags & 1) != 0) {
       vaddr = p->p_vaddr;
+#if 0
+fprintf(stderr, "check_shlib %s: %lx\n", fn.c_str(), vaddr);
+#endif
       break;
     }
   }
   elf_end(elf);
-  return vaddr == 0;
+  vaddr_r = vaddr;
+  return true;
+  // return vaddr == 0;
 }
 
 static int load_symbol_table_mod(bulkdbg_conf& cnf, const std::string& fn,
   symbol_table_mod& st)
 {
-  DBG(1, fprintf(stderr, "load_symbol_table_mod %s\n", fn.c_str()));
   std::string dbg_fn = "/usr/lib/debug" + fn + ".debug";
+#if 0
+fprintf(stderr, "dbg_fn = %s\n", dbg_fn.c_str());
+#endif
   const char *filename = 0;
   if (access(dbg_fn.c_str(), R_OK) == 0) {
     filename = dbg_fn.c_str();
   } else {
     filename = fn.c_str();
   }
-  st.is_relative = check_shlib(filename);
+  DBG(1, fprintf(stderr, "load_symbol_table_mod %s %s\n", fn.c_str(),
+    filename));
+  st.load_vaddr = 0;
+  st.is_relative = check_shlib(filename, st.load_vaddr);
   scoped_bfd abfd(filename);
   if (abfd.get() == 0) {
     DBG(1, fprintf(stderr, "failed to open %s\n", filename));
@@ -408,9 +431,16 @@ static int load_symbol_table_mod(bulkdbg_conf& cnf, const std::string& fn,
       continue;
     }
     symbol_ent e;
-    e.addr = sinfo.value;
+    // e.addr = sinfo.value; //  - st.load_vaddr;
+    e.addr = sinfo.value - st.load_vaddr;
+#if 0
+fprintf(stderr, "%s --- %lx -> %lx\n", sinfo.name, sinfo.value, e.addr);
+#endif
     e.name = symstr;
     if ((sym->flags & BSF_FUNCTION) != 0) {
+#if 0
+fprintf(stderr, "%s --- %lx -> %lx FUNCTION\n", sinfo.name, sinfo.value, e.addr);
+#endif
       st.symbols_func.push_back(e);
     }
     if (!cnf.exdata_list.empty()) {
@@ -459,7 +489,8 @@ static const symbol_ent *find_symbol(const symbol_table_mod& st,
   if (j == ss.end()) {
     return 0;
   }
-  is_text_r = (*j >= st.text_vma && *j < st.text_vma + st.text_size);
+  // is_text_r = (*j >= st.text_vma && *j < st.text_vma + st.text_size);
+  is_text_r = true; // FIXME???
   pos_r = j - ss.begin();
   offset_r = addr - *j;
   return &*j;
@@ -730,6 +761,7 @@ static std::string examine_symbols(bulkdbg_conf& cnf, const proc_info& pinfo,
     const symbol_ent *e = pinfo_find_symbol(cnf, pinfo, addr, offset);
     if (e != 0) {
       const syscall_info *sinfo = 0;
+      #if 0
       if (i == 0) {
 	#ifdef __i386__
 	if (i == 0 && e->name == "_dl_sysinfo_int80" && offset == 2) { // TODO
@@ -739,6 +771,7 @@ static std::string examine_symbols(bulkdbg_conf& cnf, const proc_info& pinfo,
 	sinfo = find_syscall(cnf, regs);
 	#endif
       }
+      #endif
       {
 	if (!rstr.empty()) {
 	  rstr += cnf.calltrace_delim;
@@ -1024,11 +1057,15 @@ static bool bulkdbg_backtrace_internal(bulkdbg& bpt, bool attach_ptrace_flag,
   return r;
 }
 
-static bool bulkdbg_examine_symbol_internal(bulkdbg& bpt, pid_t pid,
+static bool bulkdbg_examine_symbol_internal(bulkdbg& bpt, pid_t tid,
   unsigned long addr, std::string& sym_r, unsigned long& offset_r)
 {
-  per_process& pp = bpt.get_proc(pid);
-  bulkdbg_prepare_maps(bpt, pp, pid);
+  pid_t tgid = bpt.get_tgid(tid);
+  if (tgid < 0) {
+    return false;
+  }
+  per_process& pp = bpt.get_proc(tgid);
+  bulkdbg_prepare_maps(bpt, pp, tid);
   const symbol_ent *e = pinfo_find_symbol(bpt.cnf, pp.pinfo, addr, offset_r);
   if (e != 0) {
     if (bpt.cnf.demangle_cxx) {
@@ -1039,6 +1076,15 @@ static bool bulkdbg_examine_symbol_internal(bulkdbg& bpt, pid_t pid,
     return true;
   }
   return false;
+}
+
+static void bulkdbg_flush_maps_internal(bulkdbg& bpt, pid_t tid)
+{
+  pid_t tgid = bpt.get_tgid(tid);
+  if (tgid < 0) {
+    return;
+  }
+  bpt.erase_proc(tgid);
 }
 
 static void bulkdbg_pids(bulkdbg& bpt, const std::vector<int>& pids)
@@ -1509,6 +1555,11 @@ char *bulkdbg_examine_symbol(bulkdbg *bpt, pid_t pid, unsigned long addr,
     *offset_r = o;
   }
   return strdup(s.c_str());
+}
+
+void bulkdbg_flush_maps(bulkdbg *bpt, pid_t pid)
+{
+  bulkdbg_flush_maps_internal(*bpt, pid);
 }
 
 };
