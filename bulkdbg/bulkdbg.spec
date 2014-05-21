@@ -7,6 +7,7 @@ License: BSD
 Source: bulkdbg.tar.gz
 Packager: Akira Higuchi <higuchi dot akira at dena dot jp>
 BuildRoot: /var/tmp/%{name}-%{version}-root
+BuildRequires: libunwind elfutils-devel binutils-devel
 
 %description
 
